@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 # =========================
 VLLM_URL = os.environ.get("VLLM_URL", "http://192.168.1.210:19000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3Qoder")
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # 默认 INFO，便于观察关键步骤
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -78,16 +78,21 @@ class TaskProjection:
         self.phase_counter = 0
         self.step_created_at: Dict[str, float] = {}
         self.step_last_ready_time: Dict[str, float] = {}
+        self._step_record_map: Dict[str, Dict] = {}
 
     def _add_steps(self, steps_data: List[Dict], event_timestamp: float):
         steps_added = 0
         for s_dict in steps_data:
             sd = StepDefine(**s_dict)
             if sd.step_id not in self.steps:
+                invalid_deps = [dep for dep in sd.dependencies if dep not in self.steps]
+                if invalid_deps:
+                    logger.error(f"Step {sd.step_id[:8]} depends on non-existent steps: {invalid_deps}")
+                    continue
                 self.steps[sd.step_id] = sd
                 self.step_created_at[sd.step_id] = event_timestamp
                 self.phase_counter += 1
-                self.step_records.append({
+                record = {
                     "phase": self.phase_counter,
                     "step_id": sd.step_id,
                     "step_type": sd.step_type,
@@ -95,7 +100,9 @@ class TaskProjection:
                     "input": sd.input_data,
                     "dependencies": sd.dependencies,
                     "status": "created"
-                })
+                }
+                self.step_records.append(record)
+                self._step_record_map[sd.step_id] = record
                 steps_added += 1
         self._detect_cycle()
         return steps_added
@@ -113,6 +120,8 @@ class TaskProjection:
             visited.add(node)
             stack.add(node)
             for dep in graph.get(node, []):
+                if dep not in self.steps:
+                    continue
                 dfs(dep)
             stack.remove(node)
 
@@ -162,28 +171,25 @@ class TaskProjection:
                 "worker": payload.get("worker", "unknown"),
                 "start_time": event.timestamp
             }
-            for record in self.step_records:
-                if record["step_id"] == sid:
-                    record["started_at"] = event.timestamp
-                    record["worker_id"] = payload.get("worker")
-                    record["status"] = "running"
-                    break
+            record = self._step_record_map.get(sid)
+            if record:
+                record["started_at"] = event.timestamp
+                record["worker_id"] = payload.get("worker")
+                record["status"] = "running"
             logger.debug(f"[Projection] Step {sid[:8]} claimed by {payload.get('worker')}")
 
         elif etype == EventType.STEP_COMPLETED:
             self.running.pop(sid, None)
             self.completed.add(sid)
-            duration = 0
-            for record in self.step_records:
-                if record["step_id"] == sid:
-                    record["completed_at"] = event.timestamp
-                    duration = event.timestamp - record.get("started_at", event.timestamp)
-                    record["duration"] = duration
-                    record["output"] = payload.get("output", "")[:500]
-                    record["next_step"] = payload.get("next_step", "done")
-                    record["is_terminal"] = payload.get("is_terminal", False)
-                    record["status"] = "completed"
-                    break
+            record = self._step_record_map.get(sid)
+            if record:
+                record["completed_at"] = event.timestamp
+                duration = event.timestamp - record.get("started_at", event.timestamp)
+                record["duration"] = duration
+                record["output"] = payload.get("output", "")[:500]
+                record["next_step"] = payload.get("next_step", "done")
+                record["is_terminal"] = payload.get("is_terminal", False)
+                record["status"] = "completed"
             self.history.append({
                 "step_id": sid,
                 "step_type": self.steps.get(sid, StepDefine(sid, "unknown", {})).step_type,
@@ -217,6 +223,8 @@ class TaskProjection:
             if sid in self.completed or sid in self.running or sid in self.ready_pool or sid in self.failed_steps:
                 continue
             deps = set(step.dependencies)
+            if any(d not in self.steps for d in deps):
+                continue
             if any(d in self.failed_steps for d in deps):
                 continue
             if deps.issubset(self.completed):
@@ -258,14 +266,16 @@ class TaskProjection:
         }
 
     def print_phase_report(self, step_id: str):
-        record = next((r for r in self.step_records if r["step_id"] == step_id), None)
+        record = self._step_record_map.get(step_id)
         if not record or record.get("status") != "completed":
             return
         phase = record["phase"]
         step_type = record["step_type"].upper()
         duration = record.get("duration", 0)
-        start_str = time.strftime('%H:%M:%S', time.localtime(record["started_at"])) if record.get("started_at") else "N/A"
-        end_str = time.strftime('%H:%M:%S', time.localtime(record["completed_at"])) if record.get("completed_at") else "N/A"
+        started_at = record.get("started_at")
+        completed_at = record.get("completed_at")
+        start_str = time.strftime('%H:%M:%S', time.localtime(started_at)) if started_at else "N/A"
+        end_str = time.strftime('%H:%M:%S', time.localtime(completed_at)) if completed_at else "N/A"
         print(f"\n{'─'*70}")
         print(f"📍 Phase {phase}: {step_type} ({duration:.1f}s)")
         print(f"{'─'*70}")
@@ -286,7 +296,7 @@ class TaskProjection:
         print(f"\n📤 输出:")
         if output:
             lines = output.split("\n")
-            for i, line in enumerate(lines[:8]):  # 增加显示行数
+            for i, line in enumerate(lines[:8]):
                 if line.strip():
                     print(f"   {line[:120]}")
             if len(lines) > 8:
@@ -329,6 +339,28 @@ class EventStore:
         self._bus = bus
         self._task_locks: Dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_interval = 60
+
+    async def start_cleanup(self):
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self):
+        while True:
+            await asyncio.sleep(self._cleanup_interval)
+            now = time.time()
+            to_delete = []
+            async with self._global_lock:
+                for tid, proj in self._projections.items():
+                    if proj.is_terminal and proj.end_time and now - proj.end_time > 300:
+                        to_delete.append(tid)
+                for tid in to_delete:
+                    del self._projections[tid]
+                    if tid in self._logs:
+                        del self._logs[tid]
+                    if tid in self._task_locks:
+                        del self._task_locks[tid]
+                    logger.info(f"[EventStore] Cleaned up task {tid[:8]}")
 
     def _get_task_lock(self, task_id: str) -> asyncio.Lock:
         if task_id not in self._task_locks:
@@ -406,6 +438,11 @@ class EventStore:
     def get_logs(self, task_id: str) -> List[Event]:
         return self._logs.get(task_id, [])
 
+    async def shutdown(self):
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            await asyncio.sleep(0)
+
 # =========================
 # 事件总线（异步队列版）
 # =========================
@@ -421,12 +458,14 @@ class EventBus:
         logger.info(f"[EventBus] Subscribed {handler.__name__}, total handlers: {len(self._subscribers)}")
 
     async def publish(self, event: Event):
+        logger.info(f"[EventBus] Publishing event {event.event_type.value} for task {event.task_id[:8]}")
         await self._queue.put(event)
 
     async def _process_queue(self):
         while not self._stop_event.is_set():
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                logger.info(f"[EventBus] Processing event {event.event_type.value} for task {event.task_id[:8]}")
             except asyncio.TimeoutError:
                 continue
             coros = [self._safe_run(handler, event) for handler in self._subscribers]
@@ -458,7 +497,8 @@ class Scheduler:
         self._last_dispatch: Dict[str, Dict[str, float]] = defaultdict(dict)
         self._scan_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
-        self._pending_steps: Set[str] = set()  # 去重：队列中等待处理的步骤
+        self._pending_steps: Set[str] = set()
+        self._state_lock = asyncio.Lock()
 
     async def start_periodic_scan(self, interval: float = 5.0):
         while not self._stop_event.is_set():
@@ -476,7 +516,6 @@ class Scheduler:
                 last_ready = proj.step_last_ready_time.get(step_id, 0)
                 if now - last_ready > 10:
                     logger.info(f"[Scheduler] Re-dispatching step {step_id[:8]} (idle >10s)")
-                    # 仅发布事件，不直接放入队列，由事件处理逻辑去重
                     ready_event = Event(
                         task_id=task_id,
                         step_id=step_id,
@@ -489,7 +528,7 @@ class Scheduler:
                         logger.error(f"[Scheduler] Failed to re-dispatch step {step_id[:8]}: {e}")
 
     async def on_event(self, event: Event):
-        logger.debug(f"[Scheduler] Received {event.event_type.value} for {event.task_id[:8]}")
+        logger.info(f"[Scheduler] Received {event.event_type.value} for {event.task_id[:8]}")
 
         if event.event_type in (EventType.TASK_COMPLETED, EventType.TASK_FAILED):
             fut = self._completion_futures.get(event.task_id)
@@ -498,11 +537,13 @@ class Scheduler:
                 proj = self.store.get_projection(event.task_id)
                 if proj:
                     proj.print_final_summary()
+                async with self._state_lock:
+                    self._last_dispatch.pop(event.task_id, None)
             return
 
         if event.event_type == EventType.STEP_CLAIMED:
-            # 步骤被 claim 后，从待处理集合中移除
-            self._pending_steps.discard(event.step_id)
+            async with self._state_lock:
+                self._pending_steps.discard(event.step_id)
             return
 
         if event.event_type not in (
@@ -512,67 +553,69 @@ class Scheduler:
             EventType.STEP_RETRY,
             EventType.DAG_UPDATED,
             EventType.STEP_DEAD,
-            EventType.STEP_READY   # 处理重发的 STEP_READY
+            EventType.STEP_READY
         ):
             return
 
-        proj = self.store.get_projection(event.task_id)
-        if not proj or proj.is_terminal:
-            return
-
-        # 如果是 STEP_READY 事件（重发），直接尝试放入队列（去重）
-        if event.event_type == EventType.STEP_READY:
-            step_id = event.step_id
-            if step_id in self._pending_steps:
-                logger.debug(f"[Scheduler] Step {step_id[:8]} already pending, skipping")
+        task_lock = self.store._get_task_lock(event.task_id)
+        async with task_lock:
+            proj = self.store.get_projection(event.task_id)
+            if not proj or proj.is_terminal:
                 return
-            self._pending_steps.add(step_id)
-            await self.queue.put((event.task_id, step_id))
-            logger.info(f"[Scheduler] Re-dispatched step {step_id[:8]} from ready event")
-            return
 
-        # 正常分发可运行步骤
-        runnable = proj.get_runnable_steps()
-        if runnable:
-            dispatched = 0
-            for step in runnable:
-                if step.step_id in self._pending_steps:
-                    continue
-                now = time.time()
-                last = self._last_dispatch[event.task_id].get(step.step_id, 0)
-                if now - last < 1.0:
-                    continue
-                self._last_dispatch[event.task_id][step.step_id] = now
-                self._pending_steps.add(step.step_id)
-                ready_event = Event(
-                    task_id=event.task_id,
-                    step_id=step.step_id,
-                    event_type=EventType.STEP_READY,
-                    payload={"step_type": step.step_type}
-                )
+            if event.event_type == EventType.STEP_READY:
+                step_id = event.step_id
+                async with self._state_lock:
+                    if step_id in self._pending_steps:
+                        logger.debug(f"[Scheduler] Step {step_id[:8]} already pending, skipping")
+                        return
+                    self._pending_steps.add(step_id)
+                await self.queue.put((event.task_id, step_id))
+                logger.info(f"[Scheduler] Re-dispatched step {step_id[:8]} from ready event")
+                return
+
+            runnable = proj.get_runnable_steps()
+            if runnable:
+                logger.info(f"[Scheduler] Found {len(runnable)} runnable steps for task {event.task_id[:8]}")
+                for step in runnable:
+                    async with self._state_lock:
+                        if step.step_id in self._pending_steps:
+                            continue
+                        now = time.time()
+                        last = self._last_dispatch[event.task_id].get(step.step_id, 0)
+                        if now - last < 1.0:
+                            continue
+                        self._last_dispatch[event.task_id][step.step_id] = now
+                        self._pending_steps.add(step.step_id)
+
+                    ready_event = Event(
+                        task_id=event.task_id,
+                        step_id=step.step_id,
+                        event_type=EventType.STEP_READY,
+                        payload={"step_type": step.step_type}
+                    )
+                    try:
+                        await self.store.append_and_publish(ready_event)
+                        await self.queue.put((event.task_id, step.step_id))
+                        logger.info(f"[Scheduler] ✅ Dispatched step {step.step_id[:8]} ({step.step_type})")
+                    except Exception as e:
+                        async with self._state_lock:
+                            self._pending_steps.discard(step.step_id)
+                        logger.error(f"[Scheduler] Failed to dispatch step {step.step_id[:8]}: {e}")
+                return
+
+            await self._check_completion(event.task_id, proj)
+
+            if proj.check_deadlock(min_age_seconds=0.5):
+                logger.error(f"[Scheduler] Deadlock detected for {event.task_id[:8]}")
                 try:
-                    await self.store.append_and_publish(ready_event)
-                    await self.queue.put((event.task_id, step.step_id))
-                    logger.info(f"[Scheduler] ✅ Dispatched step {step.step_id[:8]} ({step.step_type})")
-                    dispatched += 1
+                    await self.store.append_and_publish(Event(
+                        task_id=event.task_id,
+                        event_type=EventType.TASK_FAILED,
+                        payload={"reason": "deadlock"}
+                    ))
                 except Exception as e:
-                    self._pending_steps.discard(step.step_id)
-                    logger.error(f"[Scheduler] Failed to dispatch step {step.step_id[:8]}: {e}")
-            if dispatched > 0:
-                return
-
-        await self._check_completion(event.task_id, proj)
-
-        if proj.check_deadlock(min_age_seconds=0.5):
-            logger.error(f"[Scheduler] Deadlock detected for {event.task_id[:8]}")
-            try:
-                await self.store.append_and_publish(Event(
-                    task_id=event.task_id,
-                    event_type=EventType.TASK_FAILED,
-                    payload={"reason": "deadlock"}
-                ))
-            except Exception as e:
-                logger.error(f"[Scheduler] Failed to publish deadlock event: {e}")
+                    logger.error(f"[Scheduler] Failed to publish deadlock event: {e}")
 
     async def _check_completion(self, task_id: str, proj: TaskProjection):
         status = proj.get_status()
@@ -615,7 +658,7 @@ class Worker:
         )
         self._running = True
         self._stop_event = asyncio.Event()
-        self._global_semaphore = asyncio.Semaphore(2)
+        self._global_semaphore = asyncio.Semaphore(1)
 
     def stop(self):
         self._running = False
@@ -640,7 +683,6 @@ class Worker:
                 if not success:
                     logger.warning(f"[{self.wid}] Task processing failed for {step_id[:8]}")
         finally:
-            # 关闭 AsyncOpenAI 客户端，避免事件循环关闭异常
             await self.llm.close()
             logger.info(f"[{self.wid}] Worker shut down")
 
@@ -666,7 +708,12 @@ class Worker:
                     break
                 await asyncio.sleep(0.1 * (attempt + 1))
             if not claimed:
-                logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]} after 3 attempts")
+                proj = self.store.get_projection(task_id)
+                if proj and step_id in proj.ready_pool:
+                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, re-queueing")
+                    await self.queue.put((task_id, step_id))
+                else:
+                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, step already claimed")
                 return False
 
             logger.info(f"[{self.wid}] 🚀 Executing step {step_id[:8]}")
@@ -675,7 +722,7 @@ class Worker:
                 try:
                     result = await asyncio.wait_for(
                         self._execute_llm(step, proj),
-                        timeout=60
+                        timeout=120
                     )
                 except asyncio.TimeoutError:
                     logger.error(f"[{self.wid}] Step {step_id[:8]} LLM timeout")
@@ -719,12 +766,11 @@ class Worker:
             return False
 
     async def _execute_llm(self, step: StepDefine, proj: TaskProjection) -> Dict:
-        # 收集依赖输出
         dep_results = {}
         for dep_id in step.dependencies:
-            for record in proj.step_records:
-                if record["step_id"] == dep_id and record.get("status") == "completed":
-                    dep_results[dep_id] = record.get("output", "")[:800]
+            record = proj._step_record_map.get(dep_id)
+            if record and record.get("status") == "completed":
+                dep_results[dep_id] = record.get("output", "")[:800]
 
         all_completed = []
         for record in proj.step_records:
@@ -770,7 +816,7 @@ class Worker:
     - 输出不少于 150 字。"""
         else:
             stage_instruction = f"- 根据阶段类型提供详细分析或计划，至少 150 字。\n- 严禁输出空的 'output'。"
-        # 针对不同步骤类型定制 prompt
+
         prompt = f"""你是一个高级金融分析师。当前任务：{proj.task_text}
 当前阶段类型：{step.step_type}
 
@@ -796,54 +842,41 @@ class Worker:
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=2048
+                max_tokens=6000
             )
             content = resp.choices[0].message.content
-            logger.debug(f"[{self.wid}] Raw LLM response: {content[:500]}")  # 添加调试日志
-            
-            # 3. 健壮的 JSON 提取逻辑
+            logger.debug(f"[{self.wid}] Raw LLM response: {content[:500]}")
+
             data = {}
-            # 尝试匹配最外层的花括号内容
             json_match = re.search(r'(\{.*\})', content, re.DOTALL)
-            
             if json_match:
                 try:
                     data = json.loads(json_match.group(1))
                 except json.JSONDecodeError:
-                    # 如果正则匹配了但解析失败，尝试修复简单的转义问题
                     try:
                         fixed = json_match.group(1).replace("'", '"')
                         data = json.loads(fixed)
                     except:
                         data = {"output": content}
             else:
-                # 完全没找到 JSON 结构，直接把内容塞进 output
                 data = {"output": content}
-           
+
             if not data.get("output") or str(data["output"]).strip() == "":
                 data["output"] = content if content.strip() else "模型未生成有效内容"
-            # 处理列表类型
             if isinstance(data, list):
                 data = {"output": json.dumps(data)}
             if not isinstance(data, dict):
                 data = {"output": str(data)}
-            
-            # 确保 output 非空
+
             if not data.get("output") or data["output"].strip() == "":
-                # 尝试从 content 中提取纯文本（去掉 JSON 结构）
-                if content.startswith("{") and content.endswith("}"):
-                    # 可能只有 JSON 结构，将 content 整体作为输出
-                    data["output"] = content[:800]
-                else:
-                    data["output"] = content[:800]
-            
-            # 设置默认值
+                data["output"] = content[:800] if content else "无输出"
+
             data.setdefault("delta", {})
             data.setdefault("next_step", "done")
             data.setdefault("next_steps", [])
             data.setdefault("dependencies", [])
             data.setdefault("is_terminal", data["next_step"] == "done")
-            
+
             return data
         except Exception as e:
             return {
@@ -953,6 +986,7 @@ class ProductionAgentOS:
         worker_tasks = [asyncio.create_task(w.run()) for w in self.workers]
 
         self.scheduler._scan_task = asyncio.create_task(self.scheduler.start_periodic_scan(interval=5.0))
+        await self.store.start_cleanup()
 
         await asyncio.sleep(0.3)
 
@@ -1031,6 +1065,7 @@ class ProductionAgentOS:
             except asyncio.TimeoutError:
                 logger.warning("Worker shutdown timeout")
             await self.bus.shutdown()
+            await self.store.shutdown()
 
 # =========================
 # 运行入口
