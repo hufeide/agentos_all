@@ -14,10 +14,9 @@ from openai import AsyncOpenAI
 # =========================
 # 配置与日志
 # =========================
-VLLM_URL = os.environ.get("VLLM_URL", "http://192.168.1.210:19000")
+VLLM_URL = os.environ.get("VLLM_URL", "http://192.168.1.159:19000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3Qoder")
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # 默认 INFO，便于观察关键步骤
-
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
@@ -58,7 +57,7 @@ class StepDefine:
     version: int = 1
 
 # =========================
-# 任务投影（增强版）
+# 任务投影
 # =========================
 class TaskProjection:
     def __init__(self, task_id: str, task_text: str):
@@ -80,7 +79,7 @@ class TaskProjection:
         self.step_last_ready_time: Dict[str, float] = {}
         self._step_record_map: Dict[str, Dict] = {}
 
-    def _add_steps(self, steps_data: List[Dict], event_timestamp: float):
+    def _add_steps(self, steps_data: List[Dict], event_timestamp: float) -> int:
         steps_added = 0
         for s_dict in steps_data:
             sd = StepDefine(**s_dict)
@@ -330,7 +329,7 @@ class TaskProjection:
         print(f"{'='*70}\n")
 
 # =========================
-# 事务性事件存储（增强版）
+# 事务性事件存储
 # =========================
 class EventStore:
     def __init__(self, bus: 'EventBus'):
@@ -341,47 +340,48 @@ class EventStore:
         self._global_lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_interval = 60
+        self._stop_event = asyncio.Event()
 
     async def start_cleanup(self):
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def _cleanup_loop(self):
-        while True:
-            await asyncio.sleep(self._cleanup_interval)
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._cleanup_interval)
+                break
+            except asyncio.TimeoutError:
+                pass
             now = time.time()
             to_delete = []
             async with self._global_lock:
-                for tid, proj in self._projections.items():
+                for tid, proj in list(self._projections.items()):
                     if proj.is_terminal and proj.end_time and now - proj.end_time > 300:
                         to_delete.append(tid)
                 for tid in to_delete:
                     del self._projections[tid]
-                    if tid in self._logs:
-                        del self._logs[tid]
-                    if tid in self._task_locks:
-                        del self._task_locks[tid]
-                    logger.info(f"[EventStore] Cleaned up task {tid[:8]}")
+                    self._logs.pop(tid, None)
+                    self._task_locks.pop(tid, None)
+                if to_delete:
+                    logger.info(f"[EventStore] Cleaned up {len(to_delete)} tasks")
 
     def _get_task_lock(self, task_id: str) -> asyncio.Lock:
         if task_id not in self._task_locks:
             self._task_locks[task_id] = asyncio.Lock()
         return self._task_locks[task_id]
 
-    async def append_and_publish(self, event: Event, max_retries: int = 1):
+    async def append_and_publish(self, event: Event, max_retries: int = 3):
         tid = event.task_id
         lock = self._get_task_lock(tid)
 
         async with lock:
             self._logs[tid].append(event)
-
             async with self._global_lock:
                 if event.event_type == EventType.TASK_SUBMITTED and tid not in self._projections:
                     task_text = event.payload.get("task", "")
                     self._projections[tid] = TaskProjection(tid, task_text)
-
             if tid in self._projections:
                 self._projections[tid].apply(event)
-
             if event.event_type == EventType.STEP_COMPLETED and event.step_id:
                 proj = self._projections[tid]
                 asyncio.create_task(self._async_print_report(proj, event.step_id))
@@ -439,12 +439,17 @@ class EventStore:
         return self._logs.get(task_id, [])
 
     async def shutdown(self):
+        self._stop_event.set()
         if self._cleanup_task:
             self._cleanup_task.cancel()
-            await asyncio.sleep(0)
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        await asyncio.sleep(0)
 
 # =========================
-# 事件总线（异步队列版）
+# 事件总线
 # =========================
 class EventBus:
     def __init__(self):
@@ -465,6 +470,8 @@ class EventBus:
         while not self._stop_event.is_set():
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                if event is None:
+                    break
                 logger.info(f"[EventBus] Processing event {event.event_type.value} for task {event.task_id[:8]}")
             except asyncio.TimeoutError:
                 continue
@@ -484,10 +491,16 @@ class EventBus:
 
     async def shutdown(self):
         self._stop_event.set()
-        await self._worker_task
+        await self._queue.put(None)
+        try:
+            await asyncio.wait_for(self._worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("[EventBus] Shutdown timeout, forcing exit")
+            self._worker_task.cancel()
+        await asyncio.sleep(0)
 
 # =========================
-# 智能调度器（增强版，含去重）
+# 智能调度器
 # =========================
 class Scheduler:
     def __init__(self, store: EventStore, queue: asyncio.Queue):
@@ -534,11 +547,12 @@ class Scheduler:
             fut = self._completion_futures.get(event.task_id)
             if fut and not fut.done():
                 fut.set_result(event.event_type)
-                proj = self.store.get_projection(event.task_id)
-                if proj:
-                    proj.print_final_summary()
-                async with self._state_lock:
-                    self._last_dispatch.pop(event.task_id, None)
+                logger.info(f"[Scheduler] ✅ Completion future set: {event.event_type.value}")
+            proj = self.store.get_projection(event.task_id)
+            if proj:
+                proj.print_final_summary()
+            async with self._state_lock:
+                self._last_dispatch.pop(event.task_id, None)
             return
 
         if event.event_type == EventType.STEP_CLAIMED:
@@ -643,7 +657,7 @@ class Scheduler:
             await asyncio.sleep(0)
 
 # =========================
-# Worker（增强版，含客户端关闭）
+# Worker
 # =========================
 class Worker:
     def __init__(self, wid: str, queue: asyncio.Queue, store: EventStore, scheduler: Scheduler):
@@ -707,6 +721,7 @@ class Worker:
                     claimed = True
                     break
                 await asyncio.sleep(0.1 * (attempt + 1))
+            
             if not claimed:
                 proj = self.store.get_projection(task_id)
                 if proj and step_id in proj.ready_pool:
@@ -739,7 +754,6 @@ class Worker:
 
         except Exception as e:
             logger.error(f"[{self.wid}] 💥 Exception processing step {step_id[:8]}: {e}", exc_info=True)
-
             proj = self.store.get_projection(task_id)
             retries = proj.retry_counts.get(step_id, 0) if proj else 0
             step = proj.steps.get(step_id) if proj else None
@@ -801,33 +815,30 @@ class Worker:
         step_type = step.step_type
         if step_type == "think":
             stage_instruction = """- 输出对任务的拆解逻辑和初步思考，至少 200 字。
-    - 必须指定至少一个下一步类型（analyze/plan/search等），不能直接结束。"""
+- 必须指定至少一个下一步类型（analyze/plan/search 等），不能直接结束。"""
         elif step_type == "analyze":
             stage_instruction = """- 提供深度分析，至少 300 字，内容应涵盖数据解读、因果关系、市场影响等。
-    - 分析要有层次，可使用小标题或分段。"""
+- 分析要有层次，可使用小标题或分段。"""
         elif step_type == "plan":
             stage_instruction = """- 输出具体的投资策略或执行计划，至少 200 字。
-    - 策略应包含操作方向、风险控制、时机判断等要素。"""
+- 策略应包含操作方向、风险控制、时机判断等要素。"""
         elif step_type == "search":
             stage_instruction = """- 为后续分析收集和整理关键数据，输出不少于 150 字。
-    - 列出需要关注的核心指标、数据来源或当前已知的关键数据点。"""
+- 列出需要关注的核心指标、数据来源或当前已知的关键数据点。"""
         elif step_type == "reflect":
             stage_instruction = """- 反思已有分析的不足，指出可能遗漏的因素，并提出改进方向或后续验证点。
-    - 输出不少于 150 字。"""
+- 输出不少于 150 字。"""
         else:
             stage_instruction = f"- 根据阶段类型提供详细分析或计划，至少 150 字。\n- 严禁输出空的 'output'。"
 
         prompt = f"""你是一个高级金融分析师。当前任务：{proj.task_text}
 当前阶段类型：{step.step_type}
-
 【上下文信息】
 {full_context}
-
 【执行指令】
 {stage_instruction}
-- 严禁输出空的 "output"。
-- 如果任务尚未完成，"next_step" 不允许为 "done"，必须从 {valid_types[:-1]} 中选择。
-
+严禁输出空的"output"。
+如果任务尚未完成，"next_step" 不允许为"done"，必须从 {valid_types[:-1]} 中选择。
 【响应格式】
 必须返回如下 JSON 格式，不要包含任何开场白：
 {{
@@ -836,7 +847,6 @@ class Worker:
     "output": "此处填写详细的分析内容或计划路线",
     "is_terminal": false
 }}"""
-
         try:
             resp = await self.llm.chat.completions.create(
                 model=MODEL_NAME,
@@ -956,7 +966,7 @@ class Worker:
         ))
 
 # =========================
-# 主控（增强版）
+# 主控系统
 # =========================
 class ProductionAgentOS:
     def __init__(self, worker_count: int = 2):
@@ -967,11 +977,10 @@ class ProductionAgentOS:
         self.worker_count = worker_count
         self.workers: List[Worker] = []
         self._global_timeout_task: Optional[asyncio.Task] = None
-
         self.bus.subscribe(self.scheduler.on_event)
         logger.info(f"🚀 ProductionAgentOS initialized with {worker_count} workers")
 
-    async def run(self, task: str, timeout: float = 30.0) -> Dict:
+    async def run(self, task: str, timeout: float = 300.0) -> Dict:
         task_id = str(uuid.uuid4())
         print(f"\n{'='*70}")
         print(f"🚀 任务启动")
@@ -1041,7 +1050,7 @@ class ProductionAgentOS:
             proj = self.store.get_projection(task_id)
             result = {
                 "task_id": task_id,
-                "status": result_status.value,
+                "status": result_status.value if hasattr(result_status, 'value') else result_status,
                 "completed_steps": len(proj.completed) if proj else 0,
                 "total_steps": len(proj.steps) if proj else 0,
                 "duration": (proj.end_time - proj.start_time) if proj and proj.end_time else 0
