@@ -6,7 +6,7 @@ import json
 import os
 import re
 from enum import Enum
-from typing import Dict, Any, List, Set, Optional, Callable, Tuple
+from typing import Dict, Any, List, Set, Optional, Callable
 from dataclasses import dataclass, field
 from collections import defaultdict
 from openai import AsyncOpenAI
@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 # 配置与日志
 # =========================
 VLLM_URL = os.environ.get("VLLM_URL", "http://192.168.1.159:19000")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3Qoder")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3Coder")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -113,7 +113,7 @@ class TaskProjection:
 
         def dfs(node):
             if node in stack:
-                raise ValueError(f"循环依赖检测到: {node} -> {stack}")
+                raise ValueError(f"循环依赖检测到：{node} -> {stack}")
             if node in visited:
                 return
             visited.add(node)
@@ -129,7 +129,7 @@ class TaskProjection:
                 if node not in visited:
                     dfs(node)
         except ValueError as e:
-            logger.error(f"任务 {self.task_id[:8]} 存在循环依赖: {e}")
+            logger.error(f"任务 {self.task_id[:8]} 存在循环依赖：{e}")
 
     def apply(self, event: Event):
         etype = event.event_type
@@ -278,12 +278,12 @@ class TaskProjection:
         print(f"\n{'─'*70}")
         print(f"📍 Phase {phase}: {step_type} ({duration:.1f}s)")
         print(f"{'─'*70}")
-        print(f"⏰ 时间: {start_str} → {end_str}")
-        print(f"👷 执行者: {record.get('worker_id', 'Unknown')}")
-        print(f"🆔 步骤ID: {step_id[:8]}")
+        print(f"⏰ 时间：{start_str} → {end_str}")
+        print(f"👷 执行者：{record.get('worker_id', 'Unknown')}")
+        print(f"🆔 步骤 ID: {step_id[:8]}")
         if record.get("dependencies"):
             deps_str = ", ".join([d[:8] for d in record["dependencies"]])
-            print(f"🔗 依赖步骤: {deps_str}")
+            print(f"🔗 依赖步骤：{deps_str}")
         input_data = record.get("input", {})
         if input_data:
             print(f"\n📥 输入:")
@@ -312,11 +312,11 @@ class TaskProjection:
         print(f"\n{'='*70}")
         print(f"📊 执行摘要")
         print(f"{'='*70}")
-        print(f"任务ID: {self.task_id[:8]}")
-        print(f"总耗时: {total_duration:.1f}s")
-        print(f"总步骤数: {len(self.steps)}")
-        print(f"成功完成: {len(self.completed)}")
-        print(f"失败: {len(self.failed_steps)}")
+        print(f"任务 ID: {self.task_id[:8]}")
+        print(f"总耗时：{total_duration:.1f}s")
+        print(f"总步骤数：{len(self.steps)}")
+        print(f"成功完成：{len(self.completed)}")
+        print(f"失败：{len(self.failed_steps)}")
         print(f"\n⏱️  阶段耗时明细:")
         for record in self.step_records:
             if record.get("duration"):
@@ -329,7 +329,7 @@ class TaskProjection:
         print(f"{'='*70}\n")
 
 # =========================
-# 事务性事件存储
+# 事务性事件存储 (🔧 修复退出慢)
 # =========================
 class EventStore:
     def __init__(self, bus: 'EventBus'):
@@ -340,12 +340,13 @@ class EventStore:
         self._global_lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_interval = 60
-        self._stop_event = asyncio.Event()
+        self._stop_event = asyncio.Event()  # 🔧 新增：停止信号
 
     async def start_cleanup(self):
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def _cleanup_loop(self):
+        # 🔧 修复：可立即响应取消的清理循环
         while not self._stop_event.is_set():
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self._cleanup_interval)
@@ -439,6 +440,7 @@ class EventStore:
         return self._logs.get(task_id, [])
 
     async def shutdown(self):
+        # 🔧 修复：通知 cleanup 循环立即退出
         self._stop_event.set()
         if self._cleanup_task:
             self._cleanup_task.cancel()
@@ -449,7 +451,7 @@ class EventStore:
         await asyncio.sleep(0)
 
 # =========================
-# 事件总线
+# 事件总线 (🔧 修复退出慢)
 # =========================
 class EventBus:
     def __init__(self):
@@ -470,7 +472,7 @@ class EventBus:
         while not self._stop_event.is_set():
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=0.5)
-                if event is None:
+                if event is None:  # 🔧 毒丸事件，退出循环
                     break
                 logger.info(f"[EventBus] Processing event {event.event_type.value} for task {event.task_id[:8]}")
             except asyncio.TimeoutError:
@@ -490,6 +492,7 @@ class EventBus:
             return e
 
     async def shutdown(self):
+        # 🔧 修复：放入毒丸事件唤醒队列，带超时等待
         self._stop_event.set()
         await self._queue.put(None)
         try:
@@ -543,6 +546,7 @@ class Scheduler:
     async def on_event(self, event: Event):
         logger.info(f"[Scheduler] Received {event.event_type.value} for {event.task_id[:8]}")
 
+        # === 终端事件处理（保持不变）===
         if event.event_type in (EventType.TASK_COMPLETED, EventType.TASK_FAILED):
             fut = self._completion_futures.get(event.task_id)
             if fut and not fut.done():
@@ -561,17 +565,18 @@ class Scheduler:
             return
 
         if event.event_type not in (
-            EventType.TASK_SUBMITTED,
-            EventType.STEP_COMPLETED,
-            EventType.STEP_FAILED,
-            EventType.STEP_RETRY,
-            EventType.DAG_UPDATED,
-            EventType.STEP_DEAD,
-            EventType.STEP_READY
+            EventType.TASK_SUBMITTED, EventType.STEP_COMPLETED, EventType.STEP_FAILED,
+            EventType.STEP_RETRY, EventType.DAG_UPDATED, EventType.STEP_DEAD, EventType.STEP_READY
         ):
             return
 
+        # === 收集需要执行的操作（锁内只读）===
         task_lock = self.store._get_task_lock(event.task_id)
+        events_to_publish = []
+        steps_to_queue = []
+        check_completion_needed = False  # 🔧 新增标记
+        deadlock_event = None  # 🔧 新增标记
+
         async with task_lock:
             proj = self.store.get_projection(event.task_id)
             if not proj or proj.is_terminal:
@@ -584,8 +589,10 @@ class Scheduler:
                         logger.debug(f"[Scheduler] Step {step_id[:8]} already pending, skipping")
                         return
                     self._pending_steps.add(step_id)
-                await self.queue.put((event.task_id, step_id))
+                steps_to_queue.append((event.task_id, step_id))
                 logger.info(f"[Scheduler] Re-dispatched step {step_id[:8]} from ready event")
+                for item in steps_to_queue:
+                    await self.queue.put(item)
                 return
 
             runnable = proj.get_runnable_steps()
@@ -608,29 +615,48 @@ class Scheduler:
                         event_type=EventType.STEP_READY,
                         payload={"step_type": step.step_type}
                     )
-                    try:
-                        await self.store.append_and_publish(ready_event)
-                        await self.queue.put((event.task_id, step.step_id))
-                        logger.info(f"[Scheduler] ✅ Dispatched step {step.step_id[:8]} ({step.step_type})")
-                    except Exception as e:
-                        async with self._state_lock:
-                            self._pending_steps.discard(step.step_id)
-                        logger.error(f"[Scheduler] Failed to dispatch step {step.step_id[:8]}: {e}")
-                return
-
-            await self._check_completion(event.task_id, proj)
-
-            if proj.check_deadlock(min_age_seconds=0.5):
-                logger.error(f"[Scheduler] Deadlock detected for {event.task_id[:8]}")
-                try:
-                    await self.store.append_and_publish(Event(
+                    events_to_publish.append(ready_event)
+                    steps_to_queue.append((event.task_id, step.step_id))
+                    logger.info(f"[Scheduler] ✅ Prepared dispatch step {step.step_id[:8]} ({step.step_type})")
+            else:
+                # 🔧 标记需要检查完成/死锁，但不执行（避免锁内调用 append_and_publish）
+                check_completion_needed = True
+                if proj.check_deadlock(min_age_seconds=0.5):
+                    logger.error(f"[Scheduler] Deadlock detected for {event.task_id[:8]}")
+                    deadlock_event = Event(
                         task_id=event.task_id,
                         event_type=EventType.TASK_FAILED,
                         payload={"reason": "deadlock"}
-                    ))
-                except Exception as e:
-                    logger.error(f"[Scheduler] Failed to publish deadlock event: {e}")
+                    )
 
+        # === 锁外执行写操作 ===
+        # 🔧 1. 发布准备好的事件
+        for evt in events_to_publish:
+            try:
+                await self.store.append_and_publish(evt)
+            except Exception as e:
+                logger.error(f"[Scheduler] Failed to publish event: {e}")
+                if evt.step_id:
+                    async with self._state_lock:
+                        self._pending_steps.discard(evt.step_id)
+
+        # 🔧 2. 入队步骤
+        for item in steps_to_queue:
+            await self.queue.put(item)
+            logger.info(f"[Scheduler] ✅ Queued step {item[1][:8]}")
+
+        # 🔧 3. 检查完成状态（锁外调用，避免死锁）
+        if check_completion_needed:
+            proj = self.store.get_projection(event.task_id)
+            if proj and not proj.is_terminal:
+                await self._check_completion(event.task_id, proj)
+
+        # 🔧 4. 发布死锁事件（如果有）
+        if deadlock_event:
+            try:
+                await self.store.append_and_publish(deadlock_event)
+            except Exception as e:
+                logger.error(f"[Scheduler] Failed to publish deadlock event: {e}")
     async def _check_completion(self, task_id: str, proj: TaskProjection):
         status = proj.get_status()
         if status["total"] > 0 and status["running"] == 0:
@@ -966,7 +992,7 @@ class Worker:
         ))
 
 # =========================
-# 主控系统
+# 主控系统 (🔧 修复退出慢 + KeyError)
 # =========================
 class ProductionAgentOS:
     def __init__(self, worker_count: int = 2):
@@ -985,9 +1011,9 @@ class ProductionAgentOS:
         print(f"\n{'='*70}")
         print(f"🚀 任务启动")
         print(f"{'='*70}")
-        print(f"任务ID: {task_id[:8]}")
-        print(f"任务描述: {task[:60]}...")
-        print(f"开始时间: {time.strftime('%H:%M:%S')}")
+        print(f"任务 ID: {task_id[:8]}")
+        print(f"任务描述：{task[:60]}...")
+        print(f"开始时间：{time.strftime('%H:%M:%S')}")
         print(f"Workers: {self.worker_count}")
         print(f"{'='*70}\n")
 
@@ -1043,7 +1069,7 @@ class ProductionAgentOS:
                 t.cancel()
             if self._global_timeout_task:
                 self._global_timeout_task.cancel()
-            return {"task_id": task_id, "status": "submit_failed", "error": str(e)}
+            return {"task_id": task_id, "status": "submit_failed", "error": str(e), "completed_steps": 0, "total_steps": 0, "duration": 0}
 
         try:
             result_status = await asyncio.wait_for(completion_future, timeout=timeout + 5)
@@ -1061,7 +1087,14 @@ class ProductionAgentOS:
             proj = self.store.get_projection(task_id)
             if proj:
                 logger.error(f"Final status: {proj.get_status()}")
-            return {"task_id": task_id, "status": "timeout", "duration": timeout}
+            # 🔧 修复：超时返回也包含 completed_steps 和 total_steps
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "completed_steps": len(proj.completed) if proj else 0,
+                "total_steps": len(proj.steps) if proj else 0,
+                "duration": timeout
+            }
         finally:
             if self._global_timeout_task:
                 self._global_timeout_task.cancel()
