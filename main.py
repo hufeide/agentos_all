@@ -615,6 +615,7 @@ class Worker:
         )
         self._running = True
         self._stop_event = asyncio.Event()
+        self._global_semaphore = asyncio.Semaphore(2)
 
     def stop(self):
         self._running = False
@@ -670,18 +671,18 @@ class Worker:
 
             logger.info(f"[{self.wid}] 🚀 Executing step {step_id[:8]}")
             start_time = time.time()
-
-            try:
-                result = await asyncio.wait_for(
-                    self._execute_llm(step, proj),
-                    timeout=60.0
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"[{self.wid}] Step {step_id[:8]} LLM timeout")
-                raise Exception("LLM timeout")
-            except Exception as e:
-                logger.error(f"[{self.wid}] Step {step_id[:8]} LLM execution failed: {e}", exc_info=True)
-                raise
+            async with self._global_semaphore:
+                try:
+                    result = await asyncio.wait_for(
+                        self._execute_llm(step, proj),
+                        timeout=60
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[{self.wid}] Step {step_id[:8]} LLM timeout")
+                    raise Exception("LLM timeout")
+                except Exception as e:
+                    logger.error(f"[{self.wid}] Step {step_id[:8]} LLM execution failed: {e}", exc_info=True)
+                    raise
 
             await self._handle_dag_extension(task_id, step_id, step, result, proj)
 
@@ -751,7 +752,24 @@ class Worker:
         full_context = "\n".join(context_parts) if context_parts else "No previous context available."
 
         valid_types = ["think", "analyze", "reflect", "plan", "search", "done"]
-
+        step_type = step.step_type
+        if step_type == "think":
+            stage_instruction = """- 输出对任务的拆解逻辑和初步思考，至少 200 字。
+    - 必须指定至少一个下一步类型（analyze/plan/search等），不能直接结束。"""
+        elif step_type == "analyze":
+            stage_instruction = """- 提供深度分析，至少 300 字，内容应涵盖数据解读、因果关系、市场影响等。
+    - 分析要有层次，可使用小标题或分段。"""
+        elif step_type == "plan":
+            stage_instruction = """- 输出具体的投资策略或执行计划，至少 200 字。
+    - 策略应包含操作方向、风险控制、时机判断等要素。"""
+        elif step_type == "search":
+            stage_instruction = """- 为后续分析收集和整理关键数据，输出不少于 150 字。
+    - 列出需要关注的核心指标、数据来源或当前已知的关键数据点。"""
+        elif step_type == "reflect":
+            stage_instruction = """- 反思已有分析的不足，指出可能遗漏的因素，并提出改进方向或后续验证点。
+    - 输出不少于 150 字。"""
+        else:
+            stage_instruction = f"- 根据阶段类型提供详细分析或计划，至少 150 字。\n- 严禁输出空的 'output'。"
         # 针对不同步骤类型定制 prompt
         prompt = f"""你是一个高级金融分析师。当前任务：{proj.task_text}
 当前阶段类型：{step.step_type}
@@ -760,8 +778,7 @@ class Worker:
 {full_context}
 
 【执行指令】
-- 如果当前是 "think" 阶段，你必须输出对任务的拆解逻辑和初步思考。
-- 如果当前是 "analyze" 阶段，必须提供不少于 200 字的深度分析。
+{stage_instruction}
 - 严禁输出空的 "output"。
 - 如果任务尚未完成，"next_step" 不允许为 "done"，必须从 {valid_types[:-1]} 中选择。
 
