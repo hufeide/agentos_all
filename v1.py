@@ -706,7 +706,8 @@ class EventBus:
 
     def subscribe(self, handler: Callable):
         self._subscribers.append(handler)
-        logger.info(f"[EventBus] Subscribed {handler.__name__}, total handlers: {len(self._subscribers)}")
+        handler_name = getattr(handler, '__name__', repr(handler))
+        logger.info(f"[EventBus] Subscribed {handler_name}, total handlers: {len(self._subscribers)}")
 
     async def publish(self, event: Event):
         # 🔧 优化：减少日志输出，只在调试模式下输出
@@ -729,7 +730,8 @@ class EventBus:
             results = await asyncio.gather(*coros, return_exceptions=True)
             for handler, result in zip(self._subscribers, results):
                 if isinstance(result, Exception):
-                    logger.error(f"[EventBus] Handler {handler.__name__} failed: {result}")
+                    handler_name = getattr(handler, '__name__', repr(handler))
+                    logger.error(f"[EventBus] Handler {handler_name} failed: {result}")
             self._queue.task_done()
 
     async def _safe_run(self, handler: Callable, event: Event) -> Optional[Exception]:
@@ -777,6 +779,12 @@ class Scheduler:
             if proj.is_terminal:
                 continue
             for step_id in list(proj.ready_pool):
+                # 检查步骤是否还存在
+                step = proj.steps.get(step_id)
+                if step is None:
+                    logger.warning(f"[Scheduler] Step {step_id[:8]} not found in steps, removing from ready_pool")
+                    proj.ready_pool.discard(step_id)
+                    continue
                 last_ready = proj.step_last_ready_time.get(step_id, 0)
                 if now - last_ready > 10:
                     logger.info(f"[Scheduler] Re-dispatching step {step_id[:8]} (idle >10s)")
@@ -784,7 +792,7 @@ class Scheduler:
                         task_id=task_id,
                         step_id=step_id,
                         event_type=EventType.STEP_READY,
-                        payload={"step_type": proj.steps[step_id].step_type}
+                        payload={"step_type": step.step_type}
                     )
                     try:
                         await self.store.append_and_publish(ready_event)
@@ -862,6 +870,7 @@ class Scheduler:
                 # 检查是否有新的就绪步骤
                 proj._check_ready_steps()
                 # 将新就绪的步骤加入队列
+                newly_queued = []
                 for step_id in list(proj.ready_pool):  # Use list to avoid modification during iteration
                     step = proj.steps.get(step_id)
                     if step and step_id not in proj.completed and step_id not in proj.running:
@@ -871,9 +880,11 @@ class Scheduler:
                                 if step_id not in self._pending_steps:
                                     self._pending_steps.add(step_id)
                                     steps_to_queue.append((event.task_id, step_id))
+                                    newly_queued.append(step_id)
                                     logger.info(f"[Scheduler] ✅ New step {step_id[:8]} queued after DAG update")
-                # 🔧 修复：清空 ready_pool，避免重复添加相同步骤
-                proj.ready_pool.clear()
+                # 🔧 修复：只清空新加入的步骤，保留原有步骤
+                for sid in newly_queued:
+                    proj.ready_pool.discard(sid)
                 return
 
             if event.event_type == EventType.STEP_READY:
@@ -916,7 +927,7 @@ class Scheduler:
                 proj = self.store.get_projection(event.task_id)
                 if proj and not proj.is_terminal:
                     # 只有当有未完成步骤且没有活跃步骤时才认为是死锁
-                    if proj.check_deadlock(min_age_seconds=2.0):
+                    if proj.check_deadlock(min_age_seconds=0.5):
                         logger.error(f"[Scheduler] Deadlock detected for {event.task_id[:8]}")
                         deadlock_event = Event(
                             task_id=event.task_id,
@@ -994,6 +1005,7 @@ class Worker:
                     logger.warning(f"[{self.wid}] Task processing failed for {step_id[:8]}")
         finally:
             await self.llm.close()
+            await self.search_tool.close()
             logger.info(f"[{self.wid}] Worker shut down")
 
     async def _process_task(self, task_id: str, step_id: str) -> bool:
@@ -1021,10 +1033,10 @@ class Worker:
             if not claimed:
                 proj = self.store.get_projection(task_id)
                 if proj and step_id in proj.ready_pool:
-                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, re-queueing")
-                    await self.queue.put((task_id, step_id))
+                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, step may be claimed by another worker")
+                    # 不重新入队，避免死循环
                 else:
-                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, step already claimed")
+                    logger.warning(f"[{self.wid}] Failed to claim step {step_id[:8]}, step already claimed or not in ready_pool")
                 return False
 
             logger.info(f"[{self.wid}] 🚀 Executing step {step_id[:8]}")
@@ -1108,34 +1120,37 @@ class Worker:
             # 格式化搜索结果
             formatted_results = self.search_tool.format_results(results)
 
-            # 🔧 检查是否还有未完成的后续步骤
-            all_next_steps = [
+            # 🔧 检查是否还有未完成的后续步骤（不包括当前已完成的步骤）
+            all_future_steps = [
                 s.step_type for s in proj.steps.values()
-                if s.step_id not in proj.completed and s.step_id not in proj.running and s.step_id != step.step_id
+                if s.step_id not in proj.completed and s.step_id not in proj.running
             ]
             has_next_steps = any(
                 s_type in ["research", "think", "analyze", "answer", "summarize"]
-                for s_type in all_next_steps
+                for s_type in all_future_steps
             )
 
             return {
                 "output": f"【搜索时间】{current_date}\n\n{formatted_results}",
                 "next_step": "analyze" if has_next_steps else "done",
-                "is_terminal": not has_next_steps
+                "is_terminal": not has_next_steps,
+                "next_steps": ["analyze"] if has_next_steps else []
             }
         except Exception as e:
             logger.error(f"[{self.wid}] ❌ 搜索失败：{e}")
             return {
                 "output": f"搜索失败：{str(e)}",
                 "next_step": "analyze",
-                "is_terminal": False
+                "is_terminal": False,
+                "next_steps": ["analyze"]
             }
 
     async def _execute_llm_think(self, step: StepDefine, proj: TaskProjection) -> Dict:
         """使用 LLM 处理非搜索步骤"""
         dep_results = {}  # 🔧 修复：初始化 dep_results
+        step_record_map = getattr(proj, '_step_record_map', {})
         for dep_id in step.dependencies:
-            record = proj._step_record_map.get(dep_id)
+            record = step_record_map.get(dep_id)
             if record and record.get("status") == "completed":
                 dep_results[dep_id] = record.get("output", "")[:800]
 
@@ -1193,9 +1208,6 @@ class Worker:
         # 🔧 关键：如果是最后一步，直接设置为终端步骤
         if is_last_step:
             stage_instruction += "\n\n【重要】这是最后一步，请给出最终结论，设置 is_terminal 为 true。"
-
-        # 获取当前日期
-        current_date = time.strftime('%Y年%m月%d日', time.localtime())
 
         prompt = f"""你是一个高级金融分析师。当前日期：{current_date}
 当前任务：{proj.task_text}
@@ -1284,7 +1296,7 @@ class Worker:
             if not next_steps or next_steps == ["done"]:
                 # 检查是否还有未完成的步骤
                 for sid, step in proj.steps.items():
-                    if sid not in proj.completed and sid not in proj.running and sid != step_id and step.step_type != "search":
+                    if sid not in proj.completed and sid not in proj.running and sid != step_id:
                         should_complete = False
                         break
 
@@ -1310,17 +1322,13 @@ class Worker:
                 ))
             return
 
-        # 🔧 修复：检查是否已有未完成的后续步骤，如果有，就不创建新步骤
-        existing_unfinished_steps = []
-        for next_step_type in next_steps:
-            if next_step_type == "done":
-                continue
+        # 🔧 检查是否已有未完成的后续步骤，如果有，就不创建新步骤
         new_steps = []
         created_types = set()
         for i, next_step_type in enumerate(next_steps):
             if next_step_type == "done":
                 continue
-            # 🔧 跳过已有未完成步骤的类型
+            # 🔧 跳过已创建的类型
             if next_step_type in created_types:
                 continue
             # 🔧 如果已有未完成的后续步骤，跳过创建
@@ -1492,8 +1500,7 @@ class ProductionAgentOS:
 注意：如果用户提到了"搜索"，workflow 中必须包含"search"。"""
 
         try:
-            llm = AsyncOpenAI(base_url=f"{VLLM_URL}/v1", api_key="sk-ignore", timeout=30.0)
-            resp = await llm.chat.completions.create(
+            resp = await self.llm.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
