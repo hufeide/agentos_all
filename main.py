@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 # =========================
 VLLM_URL = os.environ.get("VLLM_URL", "http://192.168.1.210:19000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen3Qoder")
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -286,11 +286,11 @@ class TaskProjection:
         print(f"\n📤 输出:")
         if output:
             lines = output.split("\n")
-            for i, line in enumerate(lines[:4]):
+            for i, line in enumerate(lines[:8]):  # 增加显示行数
                 if line.strip():
-                    print(f"   {line[:80]}")
-            if len(lines) > 4:
-                print(f"   ... ({len(lines) - 4} more lines)")
+                    print(f"   {line[:120]}")
+            if len(lines) > 8:
+                print(f"   ... ({len(lines) - 8} more lines)")
         print(f"\n🎯 决策:")
         print(f"   next_step: {record.get('next_step', 'done')}")
         print(f"   is_terminal: {record.get('is_terminal', False)}")
@@ -448,7 +448,7 @@ class EventBus:
         await self._worker_task
 
 # =========================
-# 智能调度器（增强版）
+# 智能调度器（增强版，含去重）
 # =========================
 class Scheduler:
     def __init__(self, store: EventStore, queue: asyncio.Queue):
@@ -458,6 +458,7 @@ class Scheduler:
         self._last_dispatch: Dict[str, Dict[str, float]] = defaultdict(dict)
         self._scan_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._pending_steps: Set[str] = set()  # 去重：队列中等待处理的步骤
 
     async def start_periodic_scan(self, interval: float = 5.0):
         while not self._stop_event.is_set():
@@ -475,6 +476,7 @@ class Scheduler:
                 last_ready = proj.step_last_ready_time.get(step_id, 0)
                 if now - last_ready > 10:
                     logger.info(f"[Scheduler] Re-dispatching step {step_id[:8]} (idle >10s)")
+                    # 仅发布事件，不直接放入队列，由事件处理逻辑去重
                     ready_event = Event(
                         task_id=task_id,
                         step_id=step_id,
@@ -483,7 +485,6 @@ class Scheduler:
                     )
                     try:
                         await self.store.append_and_publish(ready_event)
-                        await self.queue.put((task_id, step_id))
                     except Exception as e:
                         logger.error(f"[Scheduler] Failed to re-dispatch step {step_id[:8]}: {e}")
 
@@ -499,13 +500,19 @@ class Scheduler:
                     proj.print_final_summary()
             return
 
+        if event.event_type == EventType.STEP_CLAIMED:
+            # 步骤被 claim 后，从待处理集合中移除
+            self._pending_steps.discard(event.step_id)
+            return
+
         if event.event_type not in (
             EventType.TASK_SUBMITTED,
             EventType.STEP_COMPLETED,
             EventType.STEP_FAILED,
             EventType.STEP_RETRY,
             EventType.DAG_UPDATED,
-            EventType.STEP_DEAD
+            EventType.STEP_DEAD,
+            EventType.STEP_READY   # 处理重发的 STEP_READY
         ):
             return
 
@@ -513,16 +520,30 @@ class Scheduler:
         if not proj or proj.is_terminal:
             return
 
+        # 如果是 STEP_READY 事件（重发），直接尝试放入队列（去重）
+        if event.event_type == EventType.STEP_READY:
+            step_id = event.step_id
+            if step_id in self._pending_steps:
+                logger.debug(f"[Scheduler] Step {step_id[:8]} already pending, skipping")
+                return
+            self._pending_steps.add(step_id)
+            await self.queue.put((event.task_id, step_id))
+            logger.info(f"[Scheduler] Re-dispatched step {step_id[:8]} from ready event")
+            return
+
+        # 正常分发可运行步骤
         runnable = proj.get_runnable_steps()
         if runnable:
             dispatched = 0
             for step in runnable:
+                if step.step_id in self._pending_steps:
+                    continue
                 now = time.time()
                 last = self._last_dispatch[event.task_id].get(step.step_id, 0)
                 if now - last < 1.0:
                     continue
                 self._last_dispatch[event.task_id][step.step_id] = now
-
+                self._pending_steps.add(step.step_id)
                 ready_event = Event(
                     task_id=event.task_id,
                     step_id=step.step_id,
@@ -535,6 +556,7 @@ class Scheduler:
                     logger.info(f"[Scheduler] ✅ Dispatched step {step.step_id[:8]} ({step.step_type})")
                     dispatched += 1
                 except Exception as e:
+                    self._pending_steps.discard(step.step_id)
                     logger.error(f"[Scheduler] Failed to dispatch step {step.step_id[:8]}: {e}")
             if dispatched > 0:
                 return
@@ -578,7 +600,7 @@ class Scheduler:
             await asyncio.sleep(0)
 
 # =========================
-# Worker（增强版）
+# Worker（增强版，含客户端关闭）
 # =========================
 class Worker:
     def __init__(self, wid: str, queue: asyncio.Queue, store: EventStore, scheduler: Scheduler):
@@ -600,21 +622,26 @@ class Worker:
 
     async def run(self):
         logger.info(f"[{self.wid}] Worker started")
-        while self._running:
-            try:
-                task_id, step_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                logger.info(f"[{self.wid}] Got task from queue: {step_id[:8]}")
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error(f"[{self.wid}] Error getting from queue: {e}")
-                continue
-            try:
-                success = await self._process_task(task_id, step_id)
-            finally:
-                self.queue.task_done()
-            if not success:
-                logger.warning(f"[{self.wid}] Task processing failed for {step_id[:8]}")
+        try:
+            while self._running:
+                try:
+                    task_id, step_id = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                    logger.info(f"[{self.wid}] Got task from queue: {step_id[:8]}")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"[{self.wid}] Error getting from queue: {e}")
+                    continue
+                try:
+                    success = await self._process_task(task_id, step_id)
+                finally:
+                    self.queue.task_done()
+                if not success:
+                    logger.warning(f"[{self.wid}] Task processing failed for {step_id[:8]}")
+        finally:
+            # 关闭 AsyncOpenAI 客户端，避免事件循环关闭异常
+            await self.llm.close()
+            logger.info(f"[{self.wid}] Worker shut down")
 
     async def _process_task(self, task_id: str, step_id: str) -> bool:
         try:
@@ -725,48 +752,81 @@ class Worker:
 
         valid_types = ["think", "analyze", "reflect", "plan", "search", "done"]
 
-        prompt = f"""Task: {proj.task_text}
-Current step: {step.step_type}
+        # 针对不同步骤类型定制 prompt
+        prompt = f"""你是一个高级金融分析师。当前任务：{proj.task_text}
+当前阶段类型：{step.step_type}
 
-Previous Context:
+【上下文信息】
 {full_context}
 
-Respond with JSON (max 1500 chars for output):
-{{"next_step":"type|done","next_steps":["type1","type2"],"output":"concise analysis","is_terminal":false}}
+【执行指令】
+- 如果当前是 "think" 阶段，你必须输出对任务的拆解逻辑和初步思考。
+- 如果当前是 "analyze" 阶段，必须提供不少于 200 字的深度分析。
+- 严禁输出空的 "output"。
+- 如果任务尚未完成，"next_step" 不允许为 "done"，必须从 {valid_types[:-1]} 中选择。
 
-Valid types: {', '.join(valid_types)}"""
+【响应格式】
+必须返回如下 JSON 格式，不要包含任何开场白：
+{{
+    "next_step": "下一个阶段类型",
+    "next_steps": ["可选的并行阶段"],
+    "output": "此处填写详细的分析内容或计划路线",
+    "is_terminal": false
+}}"""
 
         try:
             resp = await self.llm.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
+                temperature=0.3,
                 max_tokens=2048
             )
             content = resp.choices[0].message.content
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', content)
-                if match:
+            logger.debug(f"[{self.wid}] Raw LLM response: {content[:500]}")  # 添加调试日志
+            
+            # 3. 健壮的 JSON 提取逻辑
+            data = {}
+            # 尝试匹配最外层的花括号内容
+            json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+            
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(1))
+                except json.JSONDecodeError:
+                    # 如果正则匹配了但解析失败，尝试修复简单的转义问题
                     try:
-                        data = json.loads(match.group())
+                        fixed = json_match.group(1).replace("'", '"')
+                        data = json.loads(fixed)
                     except:
-                        data = {"output": content[:1000]}
-                else:
-                    data = {"output": content[:1000]}
-
+                        data = {"output": content}
+            else:
+                # 完全没找到 JSON 结构，直接把内容塞进 output
+                data = {"output": content}
+           
+            if not data.get("output") or str(data["output"]).strip() == "":
+                data["output"] = content if content.strip() else "模型未生成有效内容"
+            # 处理列表类型
             if isinstance(data, list):
-                data = {"output": json.dumps(data)[:800], "next_step": "done", "next_steps": [], "dependencies": []}
+                data = {"output": json.dumps(data)}
             if not isinstance(data, dict):
-                data = {"output": str(data)[:800]}
-
+                data = {"output": str(data)}
+            
+            # 确保 output 非空
+            if not data.get("output") or data["output"].strip() == "":
+                # 尝试从 content 中提取纯文本（去掉 JSON 结构）
+                if content.startswith("{") and content.endswith("}"):
+                    # 可能只有 JSON 结构，将 content 整体作为输出
+                    data["output"] = content[:800]
+                else:
+                    data["output"] = content[:800]
+            
+            # 设置默认值
             data.setdefault("delta", {})
             data.setdefault("next_step", "done")
             data.setdefault("next_steps", [])
             data.setdefault("dependencies", [])
-            data.setdefault("output", content[:800])
             data.setdefault("is_terminal", data["next_step"] == "done")
+            
             return data
         except Exception as e:
             return {
