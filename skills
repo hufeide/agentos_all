@@ -1,32 +1,72 @@
 ---
 name: iterative-forge
-description: 4-Phase architecture and coding loop with 4x iteration constraints.
+description: 基于 Tavily + superpowers(架构) + Engineer(开发) 的 4x4 闭环进化协议。
 ---
 
-# Iterative Forge Protocol
+# Iterative Forge Protocol (v2026.Professional)
 
-## 0. Pre-Flight Check (Memory)
-- **Status Check**: If current session > 160k tokens, execute `memory-manager` (80/15/3) before Phase 1.
+本协议通过“产物驱动”与“角色对垒”实现从空仓库到高可用代码的自动化演进。
 
-## Phase 1: Architecture Forge (Search & 4x Refine)
-1. **Search**: Search for "Latest [Technology Stack] Architecture Best Practices 2026".
-2. **Refine Loop (Counter: 1 to 4)**:
-   - Create 4 virtual personas (Arch-A to Arch-D) to analyze the draft.
-   - Leader aggregates critiques into `ARCH_V{N}.md`.
-   - **Constraint**: Must iterate 4 full times even if the first draft is "good".
+## 📊 全局状态定义 (STATE)
+- **REQUIREMENT**: 原始需求。
+- **FINAL_ARCH**: 架构蓝图（由 `superpowers` 产出并维护）。
+- **CODEBASE**: 源代码库（初始为 `[]`，由 `Engineer` 逐步填充）。
+- **ITER_LOG**: 迭代追踪，记录 4x4 过程中的关键修正与决策。
 
-## Phase 2: Implementation & Adversarial Audit (4x Debate)
-1. **Coder**: Generate source code based on `ARCH_V4.md`.
-2. **Audit Loop (Counter: 1 to 4)**:
-   - **Architect**: Challenge the Coder on scalability, pattern adherence, and vLLM-TP4 efficiency.
-   - **Coder**: Refactor code according to Architect's feedback.
-   - **Constraint**: Exit only after 4 rounds or manual override.
+---
 
-## Phase 3: Validation (Review & Test)
-- **Test**: Execute `pytest` and log all failures.
-- **Review**: Run static analysis for performance bottlenecks in FP8 quantization.
+## 0️⃣ 阶段 0: 内存预检 (Preflight)
+- **动作**: 监控 Token 计数。若 > 160k，强制执行原生命令 `/compact`。
+- **目标**: 确保在长对话开始前，上下文已被有效压缩。
 
-## Phase 4: Final Gate
-- **Conditional Trigger**: 
-  - IF (Tests Fail OR Reviewer Rejects): **GOTO Phase 2**.
-  - ELSE: Commit changes and generate `README.md`.
+---
+
+## 1️⃣ 阶段 1: 架构锻造 (Tavily ➔ superpowers)
+**目标**: 从“空”到“高精蓝图”。
+
+1. **全球检索**: 调用 `tavily` 获取当前领域 SOTA 方案、最佳实践及 2026 最新性能陷阱。
+2. **4x 架构对垒**:
+   - **执行者**: **`superpowers`** (作为首席架构师)。
+   - **逻辑**: `superpowers` 需模拟 4 个视角对 Tavily 结果进行“自我攻防”。
+   - **🛑 提前收敛**: 连续两轮逻辑结构（Schema/Flow）变动率 < 10% 则停止。
+3. **输出**: **FINAL_ARCH** (此为后续开发的唯一真理)。
+
+---
+
+## 2️⃣ 阶段 2: 开发对抗 (Engineer ↔ superpowers)
+**目标**: 将蓝图转化为真实 `CODEBASE`。
+
+1. **初始实现 (Cold Start)**:
+   - 调用 **`Engineer`** 技能，根据 `FINAL_ARCH` 全面初始化目录并编写核心逻辑。
+2. **4x 审计对垒**:
+   - **Architect (`superpowers`)**: 严苛对比 `CODEBASE` 与 `FINAL_ARCH`。输出“找茬”清单。
+   - **Coder (`Open-Expert-Engineer`)**: 根据清单强制重构，严禁引入未在架构中定义的冗余逻辑。
+   - **🛑 提前收敛**: 连续两轮 `Engineer` 的修改无实质架构偏离。
+3. **输出**: 初始完成的 **CODEBASE**。
+
+---
+
+## 3️⃣ 阶段 3: 深度验证 (Debug & Review)
+**不再使用 pytest，改用系统级调试与专家评审。**
+
+1. **系统化调试**:
+   - 调用 **`/systematic-debugging`** 针对 `CODEBASE` 进行压力测试与边界逻辑分析。
+   - 若发现 Bug，由 `Engineer` 即刻修复。
+2. **专家级审查**:
+   - 调用 **`/requesting-code-review`** 进行全方位代码审计（含安全、性能、一致性）。
+   - 将审查结果存入 `REVIEW_REPORT`。
+
+---
+
+## 4️⃣ 阶段 4: 终极闸口 (Executable Gate)
+**决定是否交付产物。**
+
+```python
+IF (REVIEW_REPORT.status == "PASS") AND (DEBUGGING_REPORT.no_major_bugs == True):
+    -> 生成 DEPLOYMENT.md (基于最终代码与架构)
+    -> 归档并交付 (Project Complete)
+    -> 执行最终 /compact
+ELSE:
+    -> 记录失败原因至 ITER_LOG
+    -> 强制回退至 Phase 2 (Codebase 层面重新对垒)
+    -> 若连续打回 > 2 次，要求 Architect(superpowers) 重新评估 Phase 1 架构。
