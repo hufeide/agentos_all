@@ -1,0 +1,32 @@
+---
+name: iterative-forge
+description: 4-Phase architecture and coding loop with 4x iteration constraints.
+---
+
+# Iterative Forge Protocol
+
+## 0. Pre-Flight Check (Memory)
+- **Status Check**: If current session > 160k tokens, execute `memory-manager` (80/15/3) before Phase 1.
+
+## Phase 1: Architecture Forge (Search & 4x Refine)
+1. **Search**: Search for "Latest [Technology Stack] Architecture Best Practices 2026".
+2. **Refine Loop (Counter: 1 to 4)**:
+   - Create 4 virtual personas (Arch-A to Arch-D) to analyze the draft.
+   - Leader aggregates critiques into `ARCH_V{N}.md`.
+   - **Constraint**: Must iterate 4 full times even if the first draft is "good".
+
+## Phase 2: Implementation & Adversarial Audit (4x Debate)
+1. **Coder**: Generate source code based on `ARCH_V4.md`.
+2. **Audit Loop (Counter: 1 to 4)**:
+   - **Architect**: Challenge the Coder on scalability, pattern adherence, and vLLM-TP4 efficiency.
+   - **Coder**: Refactor code according to Architect's feedback.
+   - **Constraint**: Exit only after 4 rounds or manual override.
+
+## Phase 3: Validation (Review & Test)
+- **Test**: Execute `pytest` and log all failures.
+- **Review**: Run static analysis for performance bottlenecks in FP8 quantization.
+
+## Phase 4: Final Gate
+- **Conditional Trigger**: 
+  - IF (Tests Fail OR Reviewer Rejects): **GOTO Phase 2**.
+  - ELSE: Commit changes and generate `README.md`.
