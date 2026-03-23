@@ -1,0 +1,3227 @@
+import asyncio
+import uuid
+import time
+import logging
+import json
+import os
+import re
+from enum import Enum
+from typing import Dict, Any, List, Set, Optional, Callable, Protocol, runtime_checkable, Tuple
+from dataclasses import dataclass, field
+from collections import defaultdict
+from openai import AsyncOpenAI
+import httpx
+
+# =========================
+# Protocol 定义（用于依赖注入）
+# =========================
+@runtime_checkable
+class SearchToolProtocol(Protocol):
+    """搜索工具协议"""
+    async def search(self, query: str, **kwargs) -> Dict[str, Any]: ...
+    async def search_finance(self, query: str, **kwargs) -> Dict[str, Any]: ...
+    def format_results(self, results: Dict[str, Any]) -> str: ...
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class ToolExecutorProtocol(Protocol):
+    """工具执行器协议"""
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any: ...
+    def get_available_tools(self) -> List[Dict[str, Any]]: ...
+
+
+@runtime_checkable
+class SkillExecutorProtocol(Protocol):
+    """Skill 执行器协议"""
+    async def execute(self, skill_name: str, args: Dict[str, Any]) -> Any: ...
+    def get_available_skills(self) -> List[Dict[str, Any]]: ...
+
+
+# =========================
+# Pydantic 模型定义
+# =========================
+try:
+    from pydantic import BaseModel, Field, validator
+    PYDANTIC_AVAILABLE = True
+except ImportError:
+    # 如果 Pydantic 不可用，定义占位符类
+    class BaseModel:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+    PYDANTIC_AVAILABLE = False
+
+
+class StepType(str, Enum):
+    """步骤类型常量 - 避免魔法字符串"""
+    THINK = "think"
+    SEARCH = "search"
+    RESEARCH = "research"
+    ANALYZE = "analyze"
+    ANSWER = "answer"
+    SUMMARIZE = "summarize"
+    TOOL = "tool"
+
+    @classmethod
+    def all_types(cls) -> List[str]:
+        return [cls.THINK, cls.SEARCH, cls.RESEARCH, cls.ANALYZE, cls.ANSWER, cls.SUMMARIZE, cls.TOOL]
+
+    @classmethod
+    def is_generic(cls, step_type: str) -> bool:
+        """判断是否为可能导致无限循环的通用类型"""
+        return step_type in [cls.THINK, cls.ANALYZE, cls.SUMMARIZE]
+
+
+# =========================
+# 响应格式模型（Pydantic）
+# =========================
+if PYDANTIC_AVAILABLE:
+    class LLMResponse(BaseModel):
+        """LLM 响应格式模型"""
+        action: str = Field(..., description="行动类型: tool/skill/analyze/direct")
+        tool_name: Optional[str] = Field(None, description="工具名称")
+        skill_name: Optional[str] = Field(None, description="Skill 名称")
+        tool_args: Dict[str, Any] = Field(default_factory=dict, description="工具参数")
+        output: str = Field(..., description="输出内容")
+        is_terminal: bool = Field(False, description="是否为终止步骤")
+        reasoning: str = Field("", description="决策理由")
+
+        @validator('action')
+        def validate_action(cls, v):
+            if v not in ['tool', 'skill', 'analyze', 'direct']:
+                raise ValueError(f"Invalid action: {v}")
+            return v
+else:
+    # 无 Pydantic 时的简单字典类型别名
+    LLMResponse = Dict[str, Any]
+
+# =========================
+# 框架架构设计说明
+# =========================
+"""
+ProductionAgentOS 是一个纯事件驱动的智能代理操作系统。
+
+【核心架构模式】
+1. 纯事件驱动 (Pure Event-Driven)
+   - 所有状态变更通过事件触发
+   - 事件ourcing：事件是唯一真相源
+   - TaskProjection 是事件的衍生视图
+
+2. 职责分离 (Separation of Concerns)
+   - Worker: 订阅 STEP_READY 事件，执行步骤，发布 STEP_COMPLETED 事件
+   - EventStore: 维护事件日志、更新投影、在状态变化时发布 STEP_READY 事件
+   - EventBus: 事件分发，解耦发布者和订阅者
+   - Scheduler: 只监听终端事件(TASK_COMPLETED/TASK_FAILED)，更新内部状态
+   - DAGExtender: 分析步骤结果，决定是否创建新步骤
+
+3. 原子性保证
+   - 任务级锁：保证同一任务的事件串行处理
+   - 投影状态更新和事件发布在锁内原子完成
+
+【关键设计原则】
+- 纯事件驱动：事件处理函数不发布新事件
+- STEP_READY 只在 EventStore.apply() 中根据 ready_pool 变化发布
+- 业务逻辑全部在投影的 apply() 方法中，不在事件处理器中
+"""
+
+
+# =========================
+# 统一配置管理
+# =========================
+class ConfigManager:
+    """
+    统一配置管理器 - 替代分散的魔法数字
+    优先级：环境变量 > config.py > 默认值
+    """
+
+    def __init__(self):
+        # 从 config.py 加载（如果可用）
+        self._config = None
+        try:
+            from config import config
+            self._config = config
+        except ImportError:
+            pass
+
+        # 重试策略
+        self.MAX_STEP_RETRIES = self._get_int("MAX_STEP_RETRIES", 3)
+        self.MAX_CLAIM_RETRIES = self._get_int("MAX_CLAIM_RETRIES", 3)
+        self.MAX_PUBLISH_RETRIES = self._get_int("MAX_PUBLISH_RETRIES", 3)
+        self.MAX_SHUTDOWN_RETRIES = self._get_int("MAX_SHUTDOWN_RETRIES", 3)
+
+        # 重试等待时间（秒）
+        self.CLAIM_RETRY_BASE = self._get_float("CLAIM_RETRY_BASE", 0.1)
+        self.CLAIM_RETRY_MAX = self._get_float("CLAIM_RETRY_MAX", 0.3)
+        self.PUBLISH_RETRY_BASE = self._get_float("PUBLISH_RETRY_BASE", 0.05)
+        self.PUBLISH_RETRY_MAX = self._get_float("PUBLISH_RETRY_MAX", 0.15)
+        self.EXECUTION_RETRY_BASE = self._get_float("EXECUTION_RETRY_BASE", 0.2)
+        self.EXECUTION_RETRY_MAX = self._get_float("EXECUTION_RETRY_MAX", 1.0)
+
+        # 超时配置（秒）
+        self.GLOBAL_TIMEOUT = self._get_int("GLOBAL_TIMEOUT", 300)
+        self.TASK_SUBMIT_TIMEOUT = self._get_float("TASK_SUBMIT_TIMEOUT", 60.0)
+        self.EVENT_PUBLISH_TIMEOUT = self._get_float("EVENT_PUBLISH_TIMEOUT", 30.0)
+        self.STEP_EXECUTION_TIMEOUT = self._get_int("STEP_EXECUTION_TIMEOUT", 120)
+        self.STEP_CLAIM_TIMEOUT = self._get_float("STEP_CLAIM_TIMEOUT", 10.0)
+        self.STEP_READY_TIMEOUT = self._get_float("STEP_READY_TIMEOUT", 5.0)
+        self.QUEUE_TIMEOUT = self._get_float("QUEUE_TIMEOUT", 1.0)
+        self.QUEUE_PUT_TIMEOUT = self._get_float("QUEUE_PUT_TIMEOUT", 2.0)
+        self.CLEANUP_CHECK_INTERVAL = self._get_int("CLEANUP_CHECK_INTERVAL", 60)
+        self.PROJECTION_CLEANUP_DELAY = self._get_int("PROJECTION_CLEANUP_DELAY", 300)
+        self.SHUTDOWN_TIMEOUT = self._get_float("SHUTDOWN_TIMEOUT", 5.0)
+        self.BUS_SHUTDOWN_TIMEOUT = self._get_float("BUS_SHUTDOWN_TIMEOUT", 2.0)
+        self.DEADLOCK_MIN_AGE = self._get_float("DEADLOCK_MIN_AGE", 0.5)
+        self.REDISPATCH_THRESHOLD = self._get_int("REDISPATCH_THRESHOLD", 10)
+        self.DISPATCH_COOLDOWN = self._get_float("DISPATCH_COOLDOWN", 1.0)
+        self.LLM_CALL_TIMEOUT = self._get_float("LLM_CALL_TIMEOUT", 60.0)
+
+        # UUID 截断长度
+        self.UUID_TRUNC_LENGTH = self._get_int("UUID_TRUNC_LENGTH", 8)
+
+        # 上下文长度限制
+        self.STEP_OUTPUT_CONTEXT_LEN = self._get_int("STEP_OUTPUT_CONTEXT_LEN", 800)
+        self.STEP_OUTPUT_SHORT_LEN = self._get_int("STEP_OUTPUT_SHORT_LEN", 400)
+        self.STEP_OUTPUT_SUMMARY_LEN = self._get_int("STEP_OUTPUT_SUMMARY_LEN", 200)
+        self.OUTPUT_PREVIEW_LEN = self._get_int("OUTPUT_PREVIEW_LEN", 500)
+        self.HISTORY_OUTPUT_LEN = self._get_int("HISTORY_OUTPUT_LEN", 200)
+        self.LOG_PREVIEW_LEN = self._get_int("LOG_PREVIEW_LEN", 500)
+        self.MAX_READY_POOL_LOG = self._get_int("MAX_READY_POOL_LOG", 5)
+        self.MAX_CONTEXT_STEPS = self._get_int("MAX_CONTEXT_STEPS", 3)
+
+        # LLM 调用参数
+        self.LLM_MAX_TOKENS = self._get_int("LLM_MAX_TOKENS", 6000)
+        self.LLM_TEMPERATURE = self._get_float("LLM_TEMPERATURE", 0.3)
+        self.LLM_TIMEOUT = self._get_float("LLM_TIMEOUT", 60.0)
+
+        # EventBus 配置
+        self.EVENT_BUS_MAX_QUEUE_SIZE = self._get_int("EVENT_BUS_MAX_QUEUE_SIZE", 1000)
+        self.EVENT_HANDLER_RETRY_ENABLED = self._get_bool("EVENT_HANDLER_RETRY_ENABLED", False)
+        self.EVENT_HANDLER_MAX_RETRIES = self._get_int("EVENT_HANDLER_MAX_RETRIES", 3)
+
+        # 死信队列配置
+        self.DEAD_LETTER_QUEUE_ENABLED = self._get_bool("DEAD_LETTER_QUEUE_ENABLED", False)
+
+        # 从 config.py 的配置（如果有）
+        self.VLLM_URL = getattr(self._config, "vllm_url", os.getenv("VLLM_URL", "http://localhost:19000"))
+        self.MODEL_NAME = getattr(self._config, "model_name", os.getenv("MODEL_NAME", "Qwen3Qoder"))
+        self.LOG_LEVEL = getattr(self._config, "log_level", os.getenv("LOG_LEVEL", "INFO"))
+        self.TAVILY_API_KEY = getattr(self._config, "tavily_api_key", os.getenv("TAVILY_API_KEY", ""))
+        self.WORKER_COUNT = getattr(self._config, "worker_count", 2)
+        self.SKILLS_DIR = getattr(self._config, "skills_dir", "skills")
+
+    def _get_int(self, key: str, default: int) -> int:
+        return int(os.getenv(key, str(default)))
+
+    def _get_float(self, key: str, default: float) -> float:
+        return float(os.getenv(key, str(default)))
+
+    def _get_bool(self, key: str, default: bool) -> bool:
+        env_val = os.getenv(key, "")
+        if env_val:
+            return env_val.lower() == "true"
+        return default
+
+
+# 全局配置实例
+config_manager = ConfigManager()
+
+# 保持向后兼容的别名
+AgentOSDefaults = config_manager
+
+# 提供顶层访问的配置变量（从 config_manager 获取）
+VLLM_URL = config_manager.VLLM_URL
+MODEL_NAME = config_manager.MODEL_NAME
+LOG_LEVEL = config_manager.LOG_LEVEL
+TAVILY_API_KEY = config_manager.TAVILY_API_KEY
+
+
+# =========================
+# 统一错误恢复工具函数
+# =========================
+async def retry_with_backoff(
+    func,
+    max_retries: int = config_manager.MAX_STEP_RETRIES,
+    base_delay: float = 0.1,
+    max_delay: float = 1.0,
+    retryable_exceptions: Optional[Tuple] = None
+) -> Tuple[bool, Any]:
+    """
+    统一重试函数（带指数退避）
+    """
+    if retryable_exceptions is None:
+        retryable_exceptions = (Exception,)
+
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            result = await func()
+            return (True, result)
+        except asyncio.CancelledError:
+            raise
+        except retryable_exceptions as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                await asyncio.sleep(delay)
+            else:
+                break
+        except Exception as e:
+            last_error = e
+            break
+
+    return (False, last_error)
+
+
+# Tavily API URL（可配置）
+TAVILY_SEARCH_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search")
+
+# 初始化日志（使用配置中的 LOG_LEVEL）
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger("ProductionAgentOS")
+
+
+class AgentOSException(Exception):
+    """ProductionAgentOS 基础异常"""
+    pass
+
+
+class TaskNotFoundException(AgentOSException):
+    """任务未找到异常"""
+    pass
+
+
+class StepNotFoundException(AgentOSException):
+    """步骤未找到异常"""
+    pass
+
+
+class ExecutionTimeoutException(AgentOSException):
+    """执行超时异常"""
+    pass
+
+
+class StepDeadException(AgentOSException):
+    """步骤终止异常"""
+    pass
+
+
+class TaskCancellationException(AgentOSException):
+    """任务取消异常"""
+    pass
+
+
+# =========================
+# 动态加载 Skills
+# =========================
+def load_skills_from_directory(skills_dir: str = "skills") -> Dict[str, Any]:
+    """从指定目录加载所有 skills。"""
+    loaded_skills = {}
+
+    if not os.path.exists(skills_dir):
+        logger.warning(f"[Skills] Directory '{skills_dir}' does not exist")
+        return loaded_skills
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    skills_path = os.path.join(script_dir, skills_dir)
+
+    if not os.path.exists(skills_path):
+        logger.warning(f"[Skills] Skills directory not found at '{skills_path}'")
+        return loaded_skills
+
+    logger.debug(f"[Skills] Loading skills from '{skills_path}'")
+
+    for filename in os.listdir(skills_path):
+        if filename.endswith('.md') and filename not in ('README.md', 'config.yaml'):
+            skill_name = filename[:-3]
+            file_path = os.path.join(skills_path, filename)
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            skill_meta = _parse_skill_frontmatter(content)
+            skill_obj = DynamicSkill(
+                name=skill_name,
+                file_path=file_path,
+                content=content,
+                meta=skill_meta
+            )
+
+            loaded_skills[skill_name] = skill_obj
+            logger.debug(f"[Skills] Loaded skill: {skill_name}")
+
+    return loaded_skills
+
+
+def _parse_skill_frontmatter(content: str) -> Dict[str, Any]:
+    """解析 Markdown 文件的 YAML front matter。"""
+    meta = {}
+
+    if not content.startswith('---'):
+        return meta
+
+    try:
+        parts = content.split('---', 2)
+        if len(parts) >= 3:
+            yaml_content = parts[1].strip()
+            for line in yaml_content.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    meta[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception as e:
+        logger.warning(f"[Skills] Failed to parse frontmatter: {e}")
+
+    return meta
+
+
+class DynamicSkill:
+    """动态加载的 Skill 对象。"""
+    def __init__(self, name: str, file_path: str, content: str, meta: Dict[str, Any]):
+        self.name = name
+        self.file_path = file_path
+        self.content = content
+        self.meta = meta
+        self.description = meta.get('description', '')
+
+    async def run(self, **kwargs: Any) -> Dict[str, Any]:
+        """执行 skill。"""
+        logger.debug(f"[DynamicSkill] Running '{self.name}' with args: {list(kwargs.keys())}")
+        return {
+            "skill_name": self.name,
+            "description": self.description,
+            "meta": self.meta,
+            "content_length": len(self.content),
+            "success": True
+        }
+
+
+# =========================
+# 工具注册中心（Modern Agent 架构）
+# =========================
+class ToolRegistry:
+    """工具注册中心 - 管理所有可用工具"""
+
+    def __init__(self):
+        self.tools: Dict[str, Callable[..., Any]] = {}
+        self.tool_schemas: Dict[str, Dict[str, Any]] = {}
+        self.tool_descriptions: Dict[str, str] = {}
+
+    def register(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        description: str,
+        params_schema: Optional[Dict[str, Any]] = None
+    ):
+        """注册工具"""
+        self.tools[name] = func
+        self.tool_schemas[name] = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": params_schema or {"type": "object", "properties": {}}
+            }
+        }
+        self.tool_descriptions[name] = description
+        logger.debug(f"[ToolRegistry] Registered tool: {name}")
+
+    def get_available_tools(self) -> List[Dict[str, Any]]:
+        """获取可用工具列表（用于 LLM Prompt）"""
+        return list(self.tool_schemas.values())
+
+    def get_available_tool_names(self) -> List[str]:
+        """获取可用工具名称列表"""
+        return list(self.tools.keys())
+
+    def has_available_tools(self) -> bool:
+        """是否有可用工具"""
+        return len(self.tools) > 0
+
+    async def execute(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        """执行工具"""
+        if tool_name not in self.tools:
+            return f"错误：工具 '{tool_name}' 不存在"
+        try:
+            result = await self.tools[tool_name](**args)
+            return result
+        except Exception as e:
+            return f"错误：工具 '{tool_name}' 执行失败: {str(e)}"
+
+
+class SkillRegistry:
+    """Skill 注册中心 - 管理所有 Skills"""
+
+    def __init__(self):
+        self.skills: Dict[str, Any] = {}
+        self.skill_schemas: Dict[str, Dict[str, Any]] = {}
+
+    def register(self, name: str, skill: Any, description: str = "", params_schema: Optional[Dict[str, Any]] = None):
+        """注册 Skill"""
+        self.skills[name] = skill
+        self.skill_schemas[name] = {
+            "type": "skill",
+            "name": name,
+            "description": description,
+            "parameters": params_schema or {"type": "object", "properties": {}}
+        }
+        logger.debug(f"[SkillRegistry] Registered skill: {name}")
+
+    def get_available_skills(self) -> List[Dict[str, Any]]:
+        """获取可用 Skills 列表"""
+        return list(self.skill_schemas.values())
+
+    def get_available_skill_names(self) -> List[str]:
+        """获取可用 Skill 名称列表"""
+        return list(self.skills.keys())
+
+    async def execute(self, skill_name: str, args: Dict[str, Any]) -> Any:
+        """执行 Skill"""
+        if skill_name not in self.skills:
+            return f"错误：Skill '{skill_name}' 不存在"
+        try:
+            result = await self.skills[skill_name].run(**args)
+            return result
+        except Exception as e:
+            return f"错误：Skill '{skill_name}' 执行失败: {str(e)}"
+
+
+# =========================
+# Tavily 搜索工具
+# =========================
+class TavilySearchTool:
+    """Tavily 搜索工具，用于实时网络搜索获取信息"""
+
+    def __init__(self, api_key: str = TAVILY_API_KEY):
+        self.api_key = api_key
+        self.client = httpx.AsyncClient(timeout=30.0)
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        search_depth: str = "advanced",
+        include_domains: Optional[List[str]] = None,
+        exclude_domains: Optional[List[str]] = None,
+        include_answer: bool = False,
+        include_raw_content: bool = False,
+        include_images: bool = False
+    ) -> Dict[str, Any]:
+        """使用 Tavily API 进行搜索"""
+        if not self.api_key:
+            logger.warning("Tavily API key not configured, returning mock results")
+            return self._mock_search(query, max_results)
+
+        try:
+            payload = {
+                "api_key": self.api_key,
+                "query": query,
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "include_answer": include_answer,
+                "include_raw_content": include_raw_content,
+                "include_images": include_images
+            }
+
+            if include_domains:
+                payload["include_domains"] = include_domains
+            if exclude_domains:
+                payload["exclude_domains"] = exclude_domains
+
+            response = await self.client.post(
+                TAVILY_SEARCH_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            logger.debug(f"[Tavily] Search completed, found {len(result.get('results', []))} results")
+            return result
+
+        except httpx.TimeoutException:
+            logger.error("[Tavily] Search timeout")
+            return self._mock_search(query, max_results)
+        except Exception as e:
+            logger.error(f"[Tavily] Search failed: {e}")
+            return self._mock_search(query, max_results)
+
+    async def search_finance(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+        """金融相关搜索，优先从财经网站获取信息"""
+        finance_domains = [
+            "investing.com", "finance.yahoo.com", "bloomberg.com",
+            "reuters.com", "cnbc.com", "wallstreetjournal.com",
+            "seekingalpha.com", "marketwatch.com", "ft.com"
+        ]
+        return await self.search(
+            query,
+            max_results=max_results,
+            include_domains=finance_domains,
+            search_depth="advanced"
+        )
+
+    def format_results(self, results: Dict[str, Any]) -> str:
+        """格式化搜索结果为可读文本"""
+        try:
+            if not results or "results" not in results:
+                return "未找到相关搜索结果"
+
+            formatted = []
+
+            # 安全地获取 answer
+            answer = results.get("answer")
+            if answer:
+                formatted.append(f"📌 AI 摘要:\n{answer}\n")
+
+            # 安全地处理 results 列表
+            search_results = results.get("results", [])
+            if not isinstance(search_results, list):
+                search_results = []
+
+            for i, result in enumerate(search_results[:10], 1):
+                if not isinstance(result, dict):
+                    continue
+                title = result.get("title", "无标题")
+                url = result.get("url", "")
+                content = result.get("content", "")
+                score = result.get("score", 0)
+
+                formatted.append(f"{i}. **{title}**")
+                formatted.append(f"   URL: {url}")
+                formatted.append(f"   相关性：{score:.2f}")
+                if content:
+                    formatted.append(f"   摘要：{content[:200]}...")
+                formatted.append("")
+
+            # 安全地处理 images 字段（Tavily 可能返回）
+            images = results.get("images", [])
+            if images and isinstance(images, list):
+                formatted.append("\n📌 相关图片:")
+                for img in images[:3]:
+                    if isinstance(img, dict):
+                        img_url = img.get("url", "")
+                        # 使用 .get() 安全获取 info 字段
+                        img_info = img.get("info", "")
+                        if img_url:
+                            formatted.append(f"   - {img_url}")
+                            if img_info:
+                                formatted.append(f"     信息: {img_info}")
+                    elif isinstance(img, str):
+                        formatted.append(f"   - {img}")
+
+            return "\n".join(formatted)
+        except Exception as e:
+            logger.error(f"[format_results] Error: {type(e).__name__}: {e}", exc_info=True)
+            raise
+
+    def _mock_search(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+        """模拟搜索结果（用于无 API 配置时）"""
+        logger.debug(f"[Mock Search] Query: {query}")
+
+        mock_results = [
+            {
+                "title": f"关于 '{query}' 的最新分析 - 金融新闻",
+                "url": "https://example.com/finance-news",
+                "content": f"这是关于 {query} 的最新市场分析和报道...",
+                "score": 0.95
+            },
+            {
+                "title": f"{query} - 股票行情和数据",
+                "url": "https://example.com/stock-data",
+                "content": "实时股票数据、历史价格和交易量信息...",
+                "score": 0.88
+            },
+            {
+                "title": f"专家解读：{query}",
+                "url": "https://example.com/expert-analysis",
+                "content": f"行业专家对 {query} 的深度解读和投资建议...",
+                "score": 0.82
+            },
+            {
+                "title": f"{query} 市场趋势报告",
+                "url": "https://example.com/market-report",
+                "content": "最新的市场趋势分析和预测数据...",
+                "score": 0.75
+            },
+            {
+                "title": f"{query} 相关新闻汇总",
+                "url": "https://example.com/news-summary",
+                "content": f"汇总了近期关于 {query} 的重要新闻和事件...",
+                "score": 0.70
+            }
+        ]
+
+        return {
+            "query": query,
+            "results": mock_results[:max_results],
+            "answer": None,
+            "images": []
+        }
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+    async def close(self):
+        """关闭 HTTP 客户端"""
+        if hasattr(self, 'client') and self.client:
+            await self.client.aclose()
+            self.client = None
+
+
+# =========================
+# 核心事件模型
+# =========================
+class EventType(str, Enum):
+    TASK_SUBMITTED = "task_submitted"
+    DAG_UPDATED = "dag_updated"
+    STEP_READY = "step_ready"
+    STEP_CLAIMED = "step_claimed"
+    STEP_COMPLETED = "step_completed"
+    STEP_FAILED = "step_failed"
+    STEP_RETRY = "step_retry"
+    STEP_DEAD = "step_dead"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    TOOL_CALL_STARTED = "tool_call_started"
+    TOOL_CALL_COMPLETED = "tool_call_completed"
+
+
+@dataclass(frozen=True)
+class Event:
+    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    task_id: str = ""
+    step_id: Optional[str] = None
+    event_type: EventType = EventType.STEP_READY
+    payload: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class StepDefine:
+    step_id: str
+    step_type: str
+    input_data: Dict[str, Any]
+    dependencies: List[str] = field(default_factory=list)
+    max_retries: int = 3
+    version: int = 1
+
+    def __post_init__(self):
+        if self.dependencies is None:
+            self.dependencies = []
+
+
+# =========================
+# 步骤状态机定义
+# =========================
+class StepState:
+    """步骤状态枚举"""
+    CREATED = "created"
+    READY = "ready"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DEAD = "dead"
+
+
+# =========================
+# 状态转换原因（用于审计和调试）
+# =========================
+class StateTransitionReason:
+    """状态转换原因枚举"""
+    DAG_INITIALIZED = "dag_initialized"           # CREATED -> READY: DAG 初始化
+    STEP_RETRY = "step_retry"                     # FAILED -> READY: 步骤重试
+    STEP_CLAIMED = "step_claimed"                 # READY -> RUNNING: Worker 抢占
+    STEP_EXECUTED = "step_executed"               # RUNNING -> COMPLETED: 步骤执行完成
+    STEP_FAILED = "step_failed"                   # RUNNING -> FAILED: 步骤执行失败
+    STEP_TIMEOUT = "step_timeout"                 # RUNNING -> FAILED: 步骤超时
+    STEP_CANCELLED = "step_cancelled"             # */* -> DEAD: 步骤被取消
+    MAX_RETRIES_EXCEEDED = "max_retries_exceeded" # FAILED -> DEAD: 重试次数超限
+
+
+# =========================
+# 任务投影
+# =========================
+class TaskProjection:
+    def __init__(self, task_id: str, task_text: str):
+        self.task_id = task_id
+        self.task_text = task_text
+        self.steps: Dict[str, StepDefine] = {}
+        # 状态管理（单一真相源）
+        self._step_states: Dict[str, str] = {}  # step_id -> state string
+        # 状态转换记录（用于审计）
+        self._step_state_history: Dict[str, List[Dict]] = {}  # step_id -> [{state, reason, timestamp, details}]
+        # 统一的重试计数管理
+        self.step_retry_counts: Dict[str, int] = {}
+        self.is_terminal = False
+        self.start_time = time.time()
+        self.end_time: Optional[float] = None
+        self.history: List[Dict] = []
+        # 步骤记录（单一来源）
+        self.step_records: List[Dict] = []
+        self.phase_counter = 0
+        self._step_record_map: Dict[str, Dict] = {}
+
+    # =========================
+    # 统一重试计数管理方法
+    # =========================
+    def increment_retry(self, step_id: str) -> int:
+        """增加重试计数，返回当前重试次数"""
+        self.step_retry_counts[step_id] = self.step_retry_counts.get(step_id, 0) + 1
+        return self.step_retry_counts[step_id]
+
+    def reset_retry(self, step_id: str):
+        """重置步骤的重试计数"""
+        self.step_retry_counts.pop(step_id, None)
+
+    def get_retry_count(self, step_id: str) -> int:
+        """获取步骤的当前重试次数"""
+        return self.step_retry_counts.get(step_id, 0)
+
+    # =========================
+    # 状态转换历史记录
+    # =========================
+    def _record_state_transition(self, step_id: str, new_state: str, reason: str, details: Optional[Dict] = None):
+        """记录状态转换历史"""
+        if step_id not in self._step_state_history:
+            self._step_state_history[step_id] = []
+        self._step_state_history[step_id].append({
+            "from_state": self._step_states.get(step_id),
+            "to_state": new_state,
+            "reason": reason,
+            "timestamp": time.time(),
+            "details": details or {}
+        })
+
+    def get_state_history(self, step_id: str) -> List[Dict]:
+        """获取步骤的状态转换历史"""
+        return self._step_state_history.get(step_id, [])
+
+    # =========================
+    # 状态访问接口（基于 _step_states，动态计算）
+    # =========================
+    @property
+    def completed(self) -> Set[str]:
+        """返回已完成的步骤集合"""
+        return {sid for sid, state in self._step_states.items() if state == StepState.COMPLETED}
+
+    @property
+    def running(self) -> Dict[str, str]:
+        """返回正在运行的步骤字典（step_id -> state）"""
+        return {sid: state for sid, state in self._step_states.items() if state == StepState.RUNNING}
+
+    @property
+    def ready_pool(self) -> Set[str]:
+        """返回就绪池中的步骤集合"""
+        return {sid for sid, state in self._step_states.items() if state == StepState.READY}
+
+    @property
+    def failed_steps(self) -> Set[str]:
+        """返回失败的步骤集合"""
+        return {sid for sid, state in self._step_states.items() if state in (StepState.FAILED, StepState.DEAD)}
+
+    def get_runnable_steps(self) -> List[StepDefine]:
+        """获取可执行步骤列表（只检查状态，不包含业务逻辑）"""
+        if self.is_terminal:
+            return []
+        runnable = []
+        completed_set = self.completed
+        for sid, step in self.steps.items():
+            if sid in completed_set:
+                continue
+            state = self._step_states.get(sid)
+            if state in (StepState.RUNNING, StepState.READY, StepState.FAILED, StepState.DEAD):
+                continue
+            deps = set(step.dependencies)
+            if any(d not in self.steps for d in deps):
+                continue
+            if any(self._step_states.get(d) == StepState.FAILED for d in deps):
+                continue
+            if all(self._step_states.get(d) == StepState.COMPLETED for d in deps):
+                runnable.append(step)
+        return runnable
+
+    def has_uncompleted_steps(self, exclude_step_id: Optional[str] = None) -> bool:
+        """检查是否还有未完成的步骤"""
+        completed = self.completed
+        for sid in self.steps.keys():
+            if sid not in completed:
+                if exclude_step_id and sid == exclude_step_id:
+                    continue
+                logger.debug(f"[Projection] has_uncompleted_steps: {sid[:config_manager.UUID_TRUNC_LENGTH]} not completed, state={self._step_states.get(sid)}")
+                return True
+        logger.debug(f"[Projection] has_uncompleted_steps: all steps completed")
+        return False
+
+    def has_uncompleted_non_ready_steps(self, exclude_step_id: Optional[str] = None) -> bool:
+        """检查是否有未完成且不在就绪池中的步骤（真正的"待创建"步骤）"""
+        completed = self.completed
+        ready_set = self.ready_pool
+        for sid in self.steps.keys():
+            if sid not in completed:
+                if sid in ready_set:
+                    continue
+                if exclude_step_id and sid == exclude_step_id:
+                    continue
+                return True
+        return False
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "total": len(self.steps),
+            "completed": len(self.completed),
+            "running": len(self.running),
+            "ready": len(self.ready_pool),
+            "failed": len(self.failed_steps),
+            "terminal": self.is_terminal
+        }
+
+    def is_step_completed(self, step_id: str) -> bool:
+        return self._step_states.get(step_id) == StepState.COMPLETED
+
+    def is_step_running(self, step_id: str) -> bool:
+        return self._step_states.get(step_id) == StepState.RUNNING
+
+    def is_step_ready(self, step_id: str) -> bool:
+        return self._step_states.get(step_id) == StepState.READY
+
+    def get_ready_pool_steps(self) -> List[str]:
+        return list(self.ready_pool)
+
+    def get_completed_steps(self) -> List[str]:
+        return list(self.completed)
+
+    def get_running_steps(self) -> List[str]:
+        return list(self.running)
+
+    def get_step_record(self, step_id: str) -> Optional[Dict]:
+        """安全获取步骤记录（封装内部 _step_record_map 访问）"""
+        return self._step_record_map.get(step_id)
+
+    def _validate_state_transition(self, step_id: str, target_state: str) -> bool:
+        """
+        验证状态转换是否合法
+        合法转换：created -> ready -> running -> completed/failed -> dead/completed
+        """
+        current_state = self._step_states.get(step_id, StepState.CREATED)
+
+        valid_transitions = {
+            StepState.CREATED: {StepState.READY, StepState.DEAD},
+            StepState.READY: {StepState.RUNNING, StepState.DEAD},
+            StepState.RUNNING: {StepState.COMPLETED, StepState.FAILED, StepState.DEAD},
+            StepState.COMPLETED: set(),
+            StepState.FAILED: {StepState.READY, StepState.DEAD},
+            StepState.DEAD: set(),
+        }
+
+        if target_state not in valid_transitions.get(current_state, set()):
+            logger.warning(f"[Projection] Invalid state transition for {step_id[:config_manager.UUID_TRUNC_LENGTH]}: {current_state} -> {target_state}")
+            return False
+        return True
+
+    def _set_step_state(self, step_id: str, target_state: str, reason: str = "", details: Optional[Dict] = None) -> bool:
+        """设置步骤状态（带验证和历史记录）"""
+        current_state = self._step_states.get(step_id, StepState.CREATED)
+        if not self._validate_state_transition(step_id, target_state):
+            logger.warning(f"[Projection] Invalid state transition for {step_id[:config_manager.UUID_TRUNC_LENGTH]}: {current_state} -> {target_state}, rejecting")
+            return False
+        self._step_states[step_id] = target_state
+        self._record_state_transition(step_id, target_state, reason, details)
+        return True
+
+    def _transition_to_ready(self, step_id: str, reason: str = StateTransitionReason.DAG_INITIALIZED) -> bool:
+        """统一的 READY 状态转换"""
+        if self._set_step_state(step_id, StepState.READY, reason):
+            record = self.get_step_record(step_id)
+            if record:
+                record["status"] = "ready"
+            return True
+        return False
+
+    def _transition_to_running(self, step_id: str, worker_id: str, reason: str = StateTransitionReason.STEP_CLAIMED) -> bool:
+        """统一的 RUNNING 状态转换（同时记录 worker）"""
+        if not self._set_step_state(step_id, StepState.RUNNING, reason, {"worker_id": worker_id}):
+            return False
+        record = self.get_step_record(step_id)
+        if record:
+            record["started_at"] = time.time()
+            record["worker_id"] = worker_id
+            record["status"] = "running"
+            return True
+        return False
+
+    def _transition_to_completed(self, step_id: str, output: str, reason: str = StateTransitionReason.STEP_EXECUTED) -> bool:
+        """统一的 COMPLETED 状态转换（同时记录输出和.duration）"""
+        if not self._set_step_state(step_id, StepState.COMPLETED, reason):
+            return False
+        record = self.get_step_record(step_id)
+        if record:
+            record["completed_at"] = time.time()
+            record["duration"] = record["completed_at"] - record.get("started_at", record["created_at"])
+            record["output"] = output[:config_manager.STEP_OUTPUT_SHORT_LEN]
+            record["status"] = "completed"
+        return True
+
+    def _transition_to_failed(self, step_id: str, reason: str = StateTransitionReason.STEP_FAILED) -> bool:
+        """统一的 FAILED 状态转换（同时增加重试计数）"""
+        self.increment_retry(step_id)
+        if self._set_step_state(step_id, StepState.FAILED, reason):
+            record = self.get_step_record(step_id)
+            if record:
+                record["status"] = "failed"
+            return True
+        return False
+
+    def _transition_to_dead(self, step_id: str, reason: str = StateTransitionReason.STEP_CANCELLED) -> bool:
+        """统一的 DEAD 状态转换"""
+        if self._set_step_state(step_id, StepState.DEAD, reason):
+            record = self.get_step_record(step_id)
+            if record:
+                record["status"] = "dead"
+            return True
+        return False
+
+    def check_ready_steps(self, reason: str = StateTransitionReason.DAG_INITIALIZED):
+        """检查并更新就绪步骤池（用于 DAG 更新后）"""
+        logger.debug(f"[Projection] check_ready_steps: reason={reason}, total_steps={len(self.steps)}")
+        for step_id, step in self.steps.items():
+            state = self._step_states.get(step_id, StepState.CREATED)
+            if state in (StepState.COMPLETED, StepState.RUNNING, StepState.READY, StepState.FAILED, StepState.DEAD):
+                continue
+            deps = set(step.dependencies)
+            if any(d not in self.steps for d in deps):
+                logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} has missing deps: {[d for d in deps if d not in self.steps]}")
+                continue
+            if any(self._step_states.get(d) in (StepState.FAILED, StepState.DEAD) for d in deps):
+                logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} has failed deps")
+                continue
+            dep_states = {d: self._step_states.get(d) for d in deps}
+            logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} deps: {dep_states}")
+            if all(self._step_states.get(d) == StepState.COMPLETED for d in deps):
+                if self._set_step_state(step_id, StepState.READY, reason):
+                    logger.info(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} added to ready pool")
+            else:
+                logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} not ready: deps not completed, dep_states={dep_states}")
+            state = self._step_states.get(step_id, StepState.CREATED)
+            if state in (StepState.COMPLETED, StepState.RUNNING, StepState.READY, StepState.FAILED, StepState.DEAD):
+                continue
+            deps = set(step.dependencies)
+            if any(d not in self.steps for d in deps):
+                logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} has missing deps: {[d for d in deps if d not in self.steps]}")
+                continue
+            if any(self._step_states.get(d) in (StepState.FAILED, StepState.DEAD) for d in deps):
+                logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} has failed deps")
+                continue
+            dep_states = {d: self._step_states.get(d) for d in deps}
+            logger.debug(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} deps: {dep_states}")
+            if all(self._step_states.get(d) == StepState.COMPLETED for d in deps):
+                if self._set_step_state(step_id, StepState.READY, reason):
+                    logger.info(f"[Projection] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} added to ready pool")
+
+    def has_circular_dependency(self, step_id: str, visited: Optional[Set[str]] = None, path: Optional[Set[str]] = None) -> Optional[List[str]]:
+        """
+        检查步骤是否存在循环依赖（DFS 算法）
+
+        Args:
+            step_id: 要检查的步骤ID
+            visited: 已访问的步骤集合（全局）
+            path: 当前路径上的步骤集合（用于检测循环）
+
+        Returns:
+            如果存在循环依赖，返回循环路径列表；否则返回 None
+        """
+        if visited is None:
+            visited = set()
+        if path is None:
+            path = set()
+
+        if step_id in path:
+            # 找到循环，返回从循环点开始的路径
+            cycle_start = list(path).index(step_id)
+            return list(path)[cycle_start:] + [step_id]
+
+        if step_id in visited:
+            return None
+
+        if step_id not in self.steps:
+            return None
+
+        visited.add(step_id)
+        path.add(step_id)
+
+        step = self.steps[step_id]
+        for dep_id in step.dependencies:
+            cycle = self.has_circular_dependency(dep_id, visited, path)
+            if cycle:
+                return cycle
+
+        path.remove(step_id)
+        return None
+
+    def detect_all_cycles(self) -> List[List[str]]:
+        """
+        检测DAG中所有的循环依赖
+
+        Returns:
+            循环路径列表的列表
+        """
+        all_cycles = []
+        visited = set()
+
+        for step_id in self.steps.keys():
+            if step_id not in visited:
+                cycle = self.has_circular_dependency(step_id, visited, set())
+                if cycle:
+                    # 避免重复记录相同的循环
+                    cycle_set = frozenset(cycle[:-1])
+                    if not any(frozenset(c[:-1]) == cycle_set for c in all_cycles):
+                        all_cycles.append(cycle)
+
+        return all_cycles
+
+    def _add_steps(self, steps_data: List[Dict], event_timestamp: float) -> int:
+        steps_added = 0
+        for s_dict in steps_data:
+            required_fields = ["step_id", "step_type", "input_data"]
+            missing = [f for f in required_fields if f not in s_dict]
+            if missing:
+                logger.error(f"Step missing required fields: {missing}")
+                continue
+            try:
+                sd = StepDefine(**s_dict)
+            except TypeError as e:
+                logger.error(f"Failed to create StepDefine: {e}")
+                continue
+            if sd.step_id not in self.steps:
+                invalid_deps = [dep for dep in sd.dependencies if dep not in self.steps]
+                if invalid_deps:
+                    logger.error(f"Step {sd.step_id[:config_manager.UUID_TRUNC_LENGTH]} depends on non-existent steps: {invalid_deps}")
+                    continue
+                self.steps[sd.step_id] = sd
+                self.phase_counter += 1
+                record = {
+                    "phase": self.phase_counter,
+                    "step_id": sd.step_id,
+                    "step_type": sd.step_type,
+                    "created_at": event_timestamp,
+                    "input": sd.input_data,
+                    "dependencies": sd.dependencies,
+                    "status": "created"
+                }
+                self.step_records.append(record)
+                self._step_record_map[sd.step_id] = record
+                steps_added += 1
+        return steps_added
+
+    def apply(self, event: Event):
+        """
+        应用事件到投影状态
+        """
+        etype = event.event_type
+        sid = event.step_id
+        payload = event.payload
+
+        logger.debug(f"[Projection] Applying {etype.value} for task {self.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+        if etype == EventType.TASK_SUBMITTED:
+            self.task_text = payload.get("task", self.task_text)
+            initial_steps = payload.get("dag", [])
+            if initial_steps:
+                added = self._add_steps(initial_steps, event.timestamp)
+                logger.debug(f"[Projection] Task initialized with {added} initial steps")
+                self.check_ready_steps(StateTransitionReason.DAG_INITIALIZED)
+            logger.debug(f"[Projection] Task initialized: {self.task_text[:50]}...")
+
+        elif etype == EventType.DAG_UPDATED:
+            # DAG 扩展已完成，新步骤已经被添加到 self.steps 中
+            # 我们只需要设置新步骤为 READY
+            new_steps_list = payload.get("new_steps", [])
+            steps_data = payload.get("steps", [])
+            logger.info(f"[Projection] DAG_UPDATED: steps_data={len(steps_data)}, new_steps_list={len(new_steps_list)}, self.steps before={len(self.steps)}")
+            logger.info(f"[Projection] DAG_UPDATED: all steps keys = {list(self.steps.keys())}")
+            # new_steps_list 包含新步骤的 ID，需要设置它们为 READY
+            # 直接从 self.steps 中获取新步骤（因为它们已经被添加）
+            steps_to_process = []
+            if new_steps_list:
+                # 从 self.steps 中获取新步骤
+                steps_to_process = [self.steps[sid] for sid in new_steps_list if sid in self.steps]
+                logger.info(f"[Projection] Found {len(steps_to_process)} steps in self.steps from new_steps_list")
+            elif steps_data:
+                # 旧格式：直接添加步骤
+                added = self._add_steps(steps_data, event.timestamp)
+                logger.info(f"[Projection] DAG updated: +{added} steps, total={len(self.steps)}")
+                steps_to_process = list(self.steps.values())[-added:] if added > 0 else []
+
+            # 设置新步骤为 READY
+            if steps_to_process:
+                logger.info(f"[Projection] Processing {len(steps_to_process)} new steps")
+                for step in steps_to_process:
+                    sid = step.step_id
+                    # 检查所有依赖是否完成
+                    deps_met = all(dep in self.completed for dep in step.dependencies)
+                    if deps_met and sid not in self.ready_pool:
+                        logger.info(f"[Projection] Setting step {sid[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type}) to READY")
+                        self._set_step_state(sid, StepState.READY, StateTransitionReason.DAG_INITIALIZED)
+                logger.info(f"[Projection] Calling check_ready_steps after DAG updated")
+                self.check_ready_steps(StateTransitionReason.DAG_INITIALIZED)
+                logger.info(f"[Projection] check_ready_steps done, ready_pool={list(self.ready_pool)}")
+                # 打印每个步骤的状态
+                for sid, step in self.steps.items():
+                    state = self._step_states.get(sid)
+                    logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type}): state={state}")
+            else:
+                logger.warning(f"[Projection] No steps to process from DAG_UPDATED event, new_steps_list={new_steps_list}, self.steps.keys()={list(self.steps.keys())}")
+                # 即使没有步骤需要处理，也要打印当前状态
+                logger.warning(f"[Projection] All steps: {[(sid, s.step_type, self._step_states.get(sid)) for sid, s in self.steps.items()]}")
+            logger.info(f"[Projection] DAG_UPDATED done: self.steps after={len(self.steps)}")
+
+        elif etype == EventType.STEP_COMPLETED:
+            reason = StateTransitionReason.STEP_EXECUTED
+            if self._set_step_state(sid, StepState.COMPLETED, reason):
+                record = self.get_step_record(sid)
+                duration = 0
+                output_full = payload.get("output", "")
+                if record:
+                    record["completed_at"] = event.timestamp
+                    duration = event.timestamp - record.get("started_at", event.timestamp)
+                    record["duration"] = duration
+                    record["output"] = output_full[:config_manager.STEP_OUTPUT_SHORT_LEN]
+                    record["output_full"] = output_full  # 保存完整输出
+                    record["status"] = "completed"
+                # 检查是否有新的就绪步骤
+                self.check_ready_steps(StateTransitionReason.DAG_INITIALIZED)
+                self.history.append({
+                    "step_id": sid,
+                    "step_type": self.steps.get(sid, StepDefine(sid, "unknown", {})).step_type,
+                    "output": output_full[:config_manager.STEP_OUTPUT_SUMMARY_LEN],
+                    "output_full": output_full,
+                    "timestamp": event.timestamp,
+                    "duration": duration
+                })
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} completed ({duration:.1f}s) -> {payload.get('next_step', 'done')}")
+            else:
+                logger.warning(f"[Projection] Failed to complete {sid[:config_manager.UUID_TRUNC_LENGTH]}: invalid state transition")
+
+        elif etype in (EventType.TASK_COMPLETED, EventType.TASK_FAILED):
+            self.is_terminal = True
+            self.end_time = event.timestamp
+            logger.debug(f"[Projection] Task terminated: {etype.value}")
+
+        if not sid:
+            return
+
+        # 处理 STEP_READY 和 STEP_RETRY 事件
+        if etype in (EventType.STEP_READY, EventType.STEP_RETRY):
+            reason = StateTransitionReason.STEP_RETRY if etype == EventType.STEP_RETRY else StateTransitionReason.DAG_INITIALIZED
+            if self._set_step_state(sid, StepState.READY, reason):
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} set to READY state")
+            else:
+                logger.warning(f"[Projection] Failed to set {sid[:config_manager.UUID_TRUNC_LENGTH]} to READY: invalid state transition")
+
+        elif etype == EventType.STEP_CLAIMED:
+            if self._set_step_state(sid, StepState.RUNNING, StateTransitionReason.STEP_CLAIMED, {"worker_id": payload.get("worker")}):
+                record = self.get_step_record(sid)
+                if record:
+                    record["started_at"] = event.timestamp
+                    record["worker_id"] = payload.get("worker")
+                    record["status"] = "running"
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} claimed by {payload.get('worker')}")
+            else:
+                logger.warning(f"[Projection] Failed to claim {sid[:config_manager.UUID_TRUNC_LENGTH]}: invalid state transition")
+
+        elif etype == EventType.STEP_FAILED:
+            reason = StateTransitionReason.STEP_TIMEOUT if event.payload.get("error") == "timeout" else StateTransitionReason.STEP_FAILED
+            self.increment_retry(sid)
+            if self._set_step_state(sid, StepState.FAILED, reason, {"error": event.payload.get("error")}):
+                record = self.get_step_record(sid)
+                if record:
+                    record["status"] = "failed"
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} failed, retry={self.get_retry_count(sid)}")
+            else:
+                logger.warning(f"[Projection] Failed to mark {sid[:config_manager.UUID_TRUNC_LENGTH]} as failed: invalid state transition")
+
+        elif etype == EventType.STEP_RETRY:
+            # STEP_RETRY 会将步骤重新加入 READY 状态
+            if self._set_step_state(sid, StepState.READY, StateTransitionReason.STEP_RETRY):
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} retried, set back to READY")
+            else:
+                logger.warning(f"[Projection] Failed to retry {sid[:config_manager.UUID_TRUNC_LENGTH]}: invalid state transition")
+
+        elif etype == EventType.STEP_DEAD:
+            reason = event.payload.get("reason", StateTransitionReason.STEP_CANCELLED)
+            if self._set_step_state(sid, StepState.DEAD, reason, {"reason": reason}):
+                record = self.get_step_record(sid)
+                if record:
+                    record["status"] = "dead"
+                logger.debug(f"[Projection] Step {sid[:config_manager.UUID_TRUNC_LENGTH]} marked as DEAD")
+            else:
+                logger.warning(f"[Projection] Failed to mark {sid[:config_manager.UUID_TRUNC_LENGTH]} as dead: invalid state transition")
+
+    def print_phase_report(self, step_id: str):
+        """打印步骤执行报告（使用 logger）"""
+        record = self.get_step_record(step_id)
+        if not record or record.get("status") != "completed":
+            return
+        phase = record["phase"]
+        step_type = record["step_type"].upper()
+        duration = record.get("duration", 0)
+        started_at = record.get("started_at")
+        completed_at = record.get("completed_at")
+        start_str = time.strftime('%H:%M:%S', time.localtime(started_at)) if started_at else "N/A"
+        end_str = time.strftime('%H:%M:%S', time.localtime(completed_at)) if completed_at else "N/A"
+
+        logger.info(f" Phase {phase}: {step_type} ({duration:.1f}s)")
+        logger.debug(f"  Time: {start_str} -> {end_str}")
+        logger.debug(f"  Worker: {record.get('worker_id', 'Unknown')}")
+        logger.debug(f"  Step ID: {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+        if record.get("dependencies"):
+            deps_str = ", ".join([d[:config_manager.UUID_TRUNC_LENGTH] for d in record["dependencies"]])
+            logger.debug(f"  Dependencies: {deps_str}")
+
+        input_data = record.get("input", {})
+        if input_data:
+            input_str = ", ".join([f"{k}={str(v)[:30]}" for k, v in list(input_data.items())[:3]])
+            logger.debug(f"  Input: {input_str}")
+
+        output = record.get("output", "")
+        if output:
+            output_preview = output[:config_manager.STEP_OUTPUT_SUMMARY_LEN].replace("\n", " ")
+            logger.debug(f"  Output: {output_preview}...")
+
+        logger.debug(f"  Decision: next_step={record.get('next_step', 'done')}, is_terminal={record.get('is_terminal', False)}")
+
+    def print_final_summary(self):
+        """打印任务完成摘要（使用 logger）"""
+        logger.info(f"[Projection] print_final_summary: task_id={self.task_id[:config_manager.UUID_TRUNC_LENGTH]}, is_terminal={self.is_terminal}, total_steps={len(self.steps)}, completed={len(self.completed)}, steps={list(self.steps.keys())}")
+        if not self.is_terminal:
+            return
+        total_duration = (self.end_time or time.time()) - self.start_time
+
+        logger.info(f"[Projection] print_final_summary: task_id={self.task_id[:config_manager.UUID_TRUNC_LENGTH]}, total_steps={len(self.steps)}, completed={len(self.completed)}, steps={list(self.steps.keys())}")
+        logger.info(f"[Projection] print_final_summary: step_states={self._step_states}")
+
+        logger.info("=" * 70)
+        logger.info("Execution Summary")
+        logger.info("=" * 70)
+        logger.info(f"Task ID: {self.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        logger.info(f"Duration: {total_duration:.1f}s")
+        logger.info(f"Total Steps: {len(self.steps)}")
+        logger.info(f"Completed: {len(self.completed)}")
+        logger.info(f"Failed: {len(self.failed_steps)}")
+
+        # 打印每个步骤的详细信息
+        completed_records = [r for r in self.step_records if r.get("status") == "completed"]
+        for record in completed_records:
+            logger.info("-" * 50)
+            logger.info(f"Phase {record['phase']}: {record['step_type'].upper()}")
+            logger.info(f"  Duration: {record.get('duration', 0):.1f}s")
+
+            # 显示输出内容（优先使用完整输出）
+            output = record.get("output_full") or record.get("output", "")
+            if output:
+                logger.info(f"  Output: {output[:800]}...")  # 显示前800字符
+
+            # 显示决策信息
+            next_step = record.get("next_step") or "done"
+            logger.info(f"  Next step: {next_step}")
+            logger.info(f"  Worker: {record.get('worker_id', 'Unknown')}")
+
+        flow = " -> ".join([r["step_type"].upper() for r in completed_records])
+        logger.info(f"Flow: {flow}")
+        logger.info("=" * 70)
+
+
+# =========================
+# 事件存储（无循环依赖设计）
+# =========================
+class EventStore:
+    """
+    EventStore - 不持有 EventBus 引用，通过参数传递进行事件发布
+
+    架构改进：
+    - 移除 self._bus 引用，避免与 EventBus 的循环依赖
+    - 通过事件队列 _pending_events 收集待发布事件
+    - 所有需要发布事件的方法都通过 bus 参数传入
+    """
+
+    def __init__(self):
+        self._logs = defaultdict(list)
+        self._projections: Dict[str, TaskProjection] = {}
+        self._task_locks: Dict[str, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
+        # 事件收集队列（EventBus 会主动拉取）
+        self._pending_events: List[Event] = []
+        self._events_lock = asyncio.Lock()
+        # 清理任务
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_interval = 60
+        self._stop_event = asyncio.Event()
+        # 任务取消状态跟踪
+        self._cancelled_tasks: Dict[str, Dict] = {}
+        # 标记 EventStore 是否已启动
+        self._started = False
+
+    async def start_cleanup(self):
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self):
+        """清理已终止任务的投影"""
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=self._cleanup_interval)
+                except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    raise
+
+                if self._stop_event.is_set():
+                    break
+
+                now = time.time()
+                to_delete = []
+                async with self._global_lock:
+                    for tid, proj in list(self._projections.items()):
+                        if proj.is_terminal and proj.end_time and now - proj.end_time > config_manager.PROJECTION_CLEANUP_DELAY:
+                            to_delete.append(tid)
+                    for tid in to_delete:
+                        del self._projections[tid]
+                        self._logs.pop(tid, None)
+                        self._task_locks.pop(tid, None)
+                    if to_delete:
+                        logger.info(f"[EventStore] Cleaned up {len(to_delete)} tasks")
+        except asyncio.CancelledError:
+            logger.debug("[EventStore] Cleanup task cancelled")
+            raise
+
+    async def shutdown(self):
+        """关闭 EventStore"""
+        self._stop_event.set()
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(self._cleanup_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("[EventStore] Cleanup task shutdown timeout")
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
+    def get_projection(self, task_id: str) -> Optional[TaskProjection]:
+        """获取任务投影"""
+        return self._projections.get(task_id)
+
+    def _get_task_lock(self, task_id: str) -> asyncio.Lock:
+        if task_id not in self._task_locks:
+            self._task_locks[task_id] = asyncio.Lock()
+        return self._task_locks[task_id]
+
+    async def _add_pending_events(self, events: List[Event]):
+        """添加待发布事件（线程安全）"""
+        async with self._events_lock:
+            self._pending_events.extend(events)
+
+    async def _get_and_clear_pending_events(self) -> List[Event]:
+        """获取并清空待发布事件（线程安全）"""
+        async with self._events_lock:
+            events = self._pending_events.copy()
+            self._pending_events.clear()
+            return events
+
+    async def _add_steps_sync(self, task_id: str, steps_data: List[Dict], timestamp: float, bus: Optional[Any] = None, events_to_publish: Optional[List[Event]] = None) -> List[str]:
+        """同步添加步骤（在事件锁内调用），返回新步骤ID列表"""
+        proj = self._projections.get(task_id)
+        if proj:
+            prev_steps = set(proj.steps.keys())
+            prev_ready_set = {sid for sid, state in proj._step_states.items() if state == StepState.READY}
+            added = proj._add_steps(steps_data, timestamp)
+            logger.info(f"[EventStore] _add_steps_sync: +{added} steps, prev_steps={len(prev_steps)}, total={len(proj.steps)}")
+            if added > 0:
+                logger.info(f"[EventStore] _add_steps_sync: all steps keys = {list(proj.steps.keys())}")
+                logger.info(f"[EventStore] _add_steps_sync: all step states = {proj._step_states}")
+                logger.info(f"[EventStore] Calling check_ready_steps for task {task_id[:8]}")
+                proj.check_ready_steps(StateTransitionReason.DAG_INITIALIZED)
+                logger.info(f"[EventStore] check_ready_steps done, ready_pool={list(proj.ready_pool)}")
+                logger.info(f"[EventStore] _add_steps_sync: after check_ready_all step states = {proj._step_states}")
+                # 返回新添加的步骤ID
+                new_steps = list(set(proj.steps.keys()) - prev_steps)
+                # 发布新步骤的 STEP_READY 事件
+                curr_ready_set = {sid for sid, state in proj._step_states.items() if state == StepState.READY}
+                new_ready_steps = list(curr_ready_set - prev_ready_set)
+                for step_id in new_ready_steps:
+                    step = proj.steps.get(step_id)
+                    if step:
+                        logger.info(f"[EventStore] Publishing STEP_READY for {step_id[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type})")
+                        evt = Event(
+                            task_id=task_id,
+                            step_id=step_id,
+                            event_type=EventType.STEP_READY,
+                            payload={"step_type": step.step_type}
+                        )
+                        if events_to_publish is not None:
+                            events_to_publish.append(evt)
+                        elif bus is not None:
+                            try:
+                                await bus.publish(evt)
+                            except Exception as e:
+                                logger.error(f"[EventStore] Failed to publish STEP_READY for {step_id}: {e}")
+                        else:
+                            logger.warning(f"[EventStore] No bus or events_to_publish provided for STEP_READY event")
+                # 发布 DAG_UPDATED 事件
+                if added > 0:
+                    logger.info(f"[EventStore] Publishing DAG_UPDATED for {task_id[:config_manager.UUID_TRUNC_LENGTH]}, +{added} steps, new_steps={new_steps}")
+                    dag_updated_evt = Event(
+                        task_id=task_id,
+                        event_type=EventType.DAG_UPDATED,
+                        payload={"added": added, "new_steps": new_steps}  # 所有新步骤，不只有 READY 的
+                    )
+                    if events_to_publish is not None:
+                        events_to_publish.append(dag_updated_evt)
+                    elif bus is not None:
+                        try:
+                            await bus.publish(dag_updated_evt)
+                        except Exception as e:
+                            logger.error(f"[EventStore] Failed to publish DAG_UPDATED for {task_id}: {e}")
+                    else:
+                        logger.warning(f"[EventStore] No bus or events_to_publish provided for DAG_UPDATED event")
+                # 如果有新步骤被创建且任务是 terminal，需要检查是否可以恢复任务
+                if proj.is_terminal:
+                    # 检查是否所有步骤都已完成
+                    has_uncompleted = any(
+                        sid not in proj.completed and sid not in proj.failed_steps
+                        for sid in proj.steps.keys()
+                    )
+                    has_active = len(proj.running) > 0 or len(proj.ready_pool) > 0
+                    if has_active or has_uncompleted:
+                        # 有活动步骤或未完成步骤，恢复任务
+                        proj.is_terminal = False
+                        logger.info(f"[EventStore] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} resumed: has_active={has_active}, has_uncompleted={has_uncompleted}")
+                    elif added > 0:
+                        # 即使所有步骤都完成了，但有新步骤被添加，也需要恢复任务
+                        # 这处理了 TASK_COMPLETED 已发布但新步骤刚被添加的情况
+                        proj.is_terminal = False
+                        proj.end_time = None
+                        logger.info(f"[EventStore] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} resumed: new steps added after completion, prev_completed={len(proj.completed)}, new_steps={new_steps}")
+                return new_steps
+        return []
+
+    def _add_steps_sync_internal(self, task_id: str, steps_data: List[Dict], timestamp: float, events_to_publish: List[Event]) -> None:
+        """
+        内部方法：在事件锁内同步添加步骤（添加事件到 events_to_publish）
+
+        这个方法在 append_and_publish 的锁内调用，直接添加步骤到投影
+        并将需要发布的事件添加到 events_to_publish 列表中
+        """
+        proj = self._projections.get(task_id)
+        if proj:
+            prev_steps = set(proj.steps.keys())
+            prev_ready_set = set()
+            for sid, state in proj._step_states.items():
+                if state == StepState.READY:
+                    prev_ready_set.add(sid)
+
+            added = proj._add_steps(steps_data, timestamp)
+            logger.info(f"[EventStore] _add_steps_sync_internal: +{added} steps, total={len(proj.steps)}")
+            if added > 0:
+                # 更新步骤状态
+                proj.check_ready_steps(StateTransitionReason.DAG_INITIALIZED)
+
+                # 计算新就绪的步骤
+                curr_ready_set = set()
+                for sid, state in proj._step_states.items():
+                    if state == StepState.READY:
+                        curr_ready_set.add(sid)
+                new_ready_steps = list(curr_ready_set - prev_ready_set)
+                logger.info(f"[EventStore] _add_steps_sync_internal: new_ready_steps={new_ready_steps}")
+
+                # 为新就绪步骤添加 STEP_READY 事件
+                for step_id in new_ready_steps:
+                    step = proj.steps.get(step_id)
+                    if step:
+                        logger.info(f"[EventStore] Adding STEP_READY for {step_id[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type})")
+                        events_to_publish.append(Event(
+                            task_id=task_id,
+                            step_id=step_id,
+                            event_type=EventType.STEP_READY,
+                            payload={"step_type": step.step_type}
+                        ))
+                # 添加 DAG_UPDATED 事件
+                new_steps = list(set(proj.steps.keys()) - prev_steps)
+                if added > 0:
+                    logger.info(f"[EventStore] Adding DAG_UPDATED for {task_id[:config_manager.UUID_TRUNC_LENGTH]}, +{added} steps")
+                    events_to_publish.append(Event(
+                        task_id=task_id,
+                        event_type=EventType.DAG_UPDATED,
+                        payload={"added": added, "new_steps": new_steps}
+                    ))
+
+    async def append_and_publish(self, event: Event, bus: Any, max_retries: Optional[int] = None):
+        """
+        存储事件并更新投影，原子地完成所有操作（包括事件发布）
+
+        架构说明：
+        - 在任务锁内完成所有操作：状态更新 + 事件发布
+        - 使用同步的 bus.publish 内部实现确保线程安全
+        - 避免锁外发布导致的状态不一致问题
+        """
+        tid = event.task_id
+        lock = self._get_task_lock(tid)
+
+        events_to_publish: List[Event] = []
+        new_ready_steps: List[Dict] = []
+        should_complete_task = False
+
+        async with lock:
+            self._logs[tid].append(event)
+
+            # 创建投影（如果需要）
+            async with self._global_lock:
+                if event.event_type == EventType.TASK_SUBMITTED and tid not in self._projections:
+                    task_text = event.payload.get("task", "")
+                    self._projections[tid] = TaskProjection(tid, task_text)
+
+            # 应用事件到投影
+            if tid in self._projections:
+                proj = self._projections[tid]
+                logger.info(f"[EventStore] append_and_publish: proj_id={id(proj)}, total_steps={len(proj.steps)}, is_terminal={proj.is_terminal}")
+
+                # 记录变化前的 ready_pool 状态
+                prev_ready_set = set()
+                for sid, state in proj._step_states.items():
+                    if state == StepState.READY:
+                        prev_ready_set.add(sid)
+
+                proj.apply(event)
+
+                # 计算 ready_pool 变化
+                curr_ready_set = set()
+                for sid, state in proj._step_states.items():
+                    if state == StepState.READY:
+                        curr_ready_set.add(sid)
+                new_ready_steps = list(curr_ready_set - prev_ready_set)
+                logger.info(f"[EventStore] ready_pool change: prev={list(prev_ready_set)}, curr={list(curr_ready_set)}, new={new_ready_steps}")
+
+                # 记录新就绪步骤的信息（在锁内）
+                for step_id in new_ready_steps:
+                    step = proj.steps.get(step_id)
+                    if step:
+                        logger.info(f"[EventStore] Publishing STEP_READY for {step_id[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type})")
+                        events_to_publish.append(Event(
+                            task_id=tid,
+                            step_id=step_id,
+                            event_type=EventType.STEP_READY,
+                            payload={"step_type": step.step_type}
+                        ))
+                logger.info(f"[EventStore] Total events to publish: {len(events_to_publish)}")
+
+                # 检查并处理待处理的 DAG 扩展（在锁内添加新步骤）
+                # 注意：这个逻辑现在不需要了，因为 _add_steps_sync 已经在锁外调用
+                # 保留代码以备将来需要
+
+                # 检查任务是否完成
+                # 注意：如果有 DAG 扩展（STEP_COMPLETED 后异步添加新步骤），should_complete_task 会在 DAG 扩展后被重置
+                if event.event_type == EventType.STEP_COMPLETED and event.step_id:
+                    # 检查是否有未完成的步骤（包括正在运行的和就绪的）
+                    has_uncompleted = any(
+                        sid not in proj.completed and sid not in proj.failed_steps
+                        for sid in proj.steps.keys()
+                    )
+
+                    # 检查是否有活动步骤
+                    has_active_steps = (
+                        len(proj.running) > 0 or
+                        len(proj.ready_pool) > 0
+                    )
+
+                    if has_uncompleted:
+                        logger.debug(f"[EventStore] Task not complete: has_uncompleted={has_uncompleted}, ready_pool={list(proj.ready_pool)}")
+                    elif has_active_steps:
+                        # 还有活动步骤，等待它们完成
+                        logger.debug(f"[EventStore] Task not complete: has_active_steps={has_active_steps}, running={len(proj.running)}, ready_pool={len(proj.ready_pool)}")
+                    elif proj.steps:
+                        # 所有步骤都完成了
+                        logger.info(f"[EventStore] Task complete check: total_steps={len(proj.steps)}, ready_pool={len(proj.ready_pool)}, running={len(proj.running)}, completed={len(proj.completed)}, failed={len(proj.failed_steps)}")
+                        logger.info(f"[EventStore] Task complete check: all steps = {list(proj.steps.keys())}")
+                        should_complete_task = True
+                        logger.info(f"[EventStore] Task complete: all steps done, no active steps")
+
+            # 如果需要完成任务
+            if should_complete_task:
+                proj = self._projections.get(tid)
+                if proj and not proj.is_terminal:
+                    events_to_publish.append(Event(
+                        task_id=tid,
+                        event_type=EventType.TASK_COMPLETED,
+                        payload={"duration": time.time() - proj.start_time}
+                    ))
+                    proj.is_terminal = True
+                    proj.end_time = time.time()
+                    logger.debug(f"[EventStore] Task {tid[:config_manager.UUID_TRUNC_LENGTH]} completed automatically")
+
+        # 在锁外发布事件（使用 bus.publish 的异步安全版本）
+        if max_retries is None:
+            max_retries = config_manager.MAX_PUBLISH_RETRIES
+
+        logger.debug(f"[EventStore] Publishing {len(events_to_publish)} events for task {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+        # 发布原事件
+        async def publish_wrapper():
+            return await bus.publish(event)
+
+        try:
+            success, result = await retry_with_backoff(
+                publish_wrapper,
+                max_retries=max_retries,
+                base_delay=config_manager.PUBLISH_RETRY_BASE,
+                max_delay=config_manager.PUBLISH_RETRY_MAX
+            )
+            if not success:
+                logger.error(f"[EventStore] Publish failed: {result}")
+                raise result
+        except Exception as e:
+            logger.error(f"[EventStore] Exception during publish: {e}", exc_info=True)
+            raise
+
+        # 发布新生成的事件（STEP_READY 等）
+        for evt in events_to_publish:
+            try:
+                await bus.publish(evt)
+            except Exception as pub_e:
+                logger.error(f"[EventStore] Failed to publish {evt.event_type.value}: {pub_e}")
+
+        # STEP_COMPLETED 后打印报告（异步，不阻塞）
+        if event.event_type == EventType.STEP_COMPLETED and event.step_id and tid in self._projections:
+            asyncio.create_task(self._async_print_report(self._projections[tid], event.step_id))
+
+    async def _async_print_report(self, proj: TaskProjection, step_id: str):
+        proj.print_phase_report(step_id)
+
+    async def try_claim_step(self, task_id: str, step_id: str, worker_id: str, bus: Any, max_retries: int = 2) -> Optional[Event]:
+        """
+        尝试 claim 一个步骤供 Worker 执行
+        原子检查并设置为 RUNNING 状态，发布 STEP_CLAIMED 事件
+
+        Args:
+            task_id: 任务ID
+            step_id: 步骤ID
+            worker_id: Worker ID
+            bus: EventBus 实例，用于发布事件
+            max_retries: 最大重试次数（保留参数，当前未使用）
+        """
+        logger.debug(f"[EventStore] try_claim_step for {step_id[:config_manager.UUID_TRUNC_LENGTH]} by {worker_id}")
+        lock = self._get_task_lock(task_id)
+
+        async with lock:
+            proj = self._projections.get(task_id)
+            if not proj:
+                logger.warning(f"[EventStore] Claim failed: projection missing for {task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+                return None
+            if proj.is_terminal:
+                logger.debug(f"[EventStore] Claim failed: task {task_id[:config_manager.UUID_TRUNC_LENGTH]} is terminal")
+                return None
+
+            # 原子检查并设置 RUNNING 状态（通过状态机）
+            if step_id not in proj.ready_pool:
+                logger.debug(f"[EventStore] Claim failed: step {step_id[:config_manager.UUID_TRUNC_LENGTH]} not in ready_pool (ready_pool={list(proj.ready_pool)})")
+                return None
+
+            # 使用带原因的状态转换方法
+            if not proj._transition_to_running(step_id, worker_id, StateTransitionReason.STEP_CLAIMED):
+                logger.warning(f"[EventStore] Claim failed: invalid state transition for {step_id[:config_manager.UUID_TRUNC_LENGTH]} (state={proj._step_states.get(step_id)})")
+                return None
+
+            logger.info(f"[EventStore] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} claimed by {worker_id} (atomic)")
+            logger.debug(f"[EventStore] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} state after claim: {proj._step_states.get(step_id)}")
+
+            # 发布 STEP_CLAIMED 事件（在锁内，但 bus.publish 是异步队列操作）
+            claim_event = Event(
+                task_id=task_id,
+                step_id=step_id,
+                event_type=EventType.STEP_CLAIMED,
+                payload={"worker": worker_id}
+            )
+            try:
+                logger.debug(f"[EventStore] Publishing STEP_CLAIMED event for {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+                await bus.publish(claim_event)
+                logger.debug(f"[EventStore] STEP_CLAIMED event published for {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+            except Exception as e:
+                logger.error(f"[EventStore] Failed to publish STEP_CLAIMED: {e}")
+
+            # 返回 None 表示 claim 成功（事件已发布）
+            return None
+
+    def get_all_projections(self) -> Dict[str, TaskProjection]:
+        """获取所有任务投影（用于调度器遍历）"""
+        return self._projections
+
+    def get_logs(self, task_id: str) -> List[Event]:
+        return self._logs.get(task_id, [])
+
+    def get_task_lock(self, task_id: str) -> asyncio.Lock:
+        """公开方法：获取任务级锁（供 Scheduler 使用）"""
+        return self._get_task_lock(task_id)
+
+    async def shutdown(self):
+        """关闭 EventStore"""
+        self._stop_event.set()
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(self._cleanup_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("[EventStore] Cleanup task shutdown timeout")
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
+    async def cancel_task(self, task_id: str, bus: Any, reason: str = "user_cancelled") -> bool:
+        """
+        取消进行中的任务
+
+        Args:
+            task_id: 任务ID
+            bus: EventBus 实例，用于发布事件
+            reason: 取消原因
+
+        Returns:
+            True if task was cancelled, False if task not found or already terminal
+        """
+        lock = self._get_task_lock(task_id)
+
+        async with lock:
+            proj = self._projections.get(task_id)
+            if not proj:
+                logger.warning(f"[EventStore] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} not found for cancellation")
+                return False
+
+            if proj.is_terminal:
+                logger.debug(f"[EventStore] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} is already terminal")
+                return False
+
+            # 标记任务为取消状态
+            proj.is_terminal = True
+            proj.end_time = time.time()
+
+            # 记录取消状态
+            self._cancelled_tasks[task_id] = {
+                "reason": reason,
+                "cancelled_at": time.time()
+            }
+
+            logger.info(f"[EventStore] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} cancelled: {reason}")
+
+            # 取消所有未完成的步骤
+            for step_id, step in proj.steps.items():
+                state = proj._step_states.get(step_id, StepState.CREATED)
+                if state not in (StepState.COMPLETED, StepState.DEAD):
+                    proj._transition_to_dead(step_id, StateTransitionReason.STEP_CANCELLED)
+
+            # 发布 TASK_FAILED 事件
+            await bus.publish(Event(
+                task_id=task_id,
+                event_type=EventType.TASK_FAILED,
+                payload={"reason": reason}
+            ))
+
+            return True
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """检查任务是否已被取消"""
+        return task_id in self._cancelled_tasks
+
+    def get_cancel_reason(self, task_id: str) -> Optional[str]:
+        """获取任务取消原因"""
+        return self._cancelled_tasks.get(task_id, {}).get("reason")
+
+
+# =========================
+# 事件总线
+# =========================
+class EventBus:
+    def __init__(self, max_queue_size: int = None):
+        # 使用配置类的默认值
+        if max_queue_size is None:
+            max_queue_size = config_manager.EVENT_BUS_MAX_QUEUE_SIZE
+
+        self._subscribers: List[Callable] = []
+        self._failure_callbacks: List[Callable[[Event, Exception], None]] = []
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+
+        # 死信队列
+        self._dead_letter_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        self._dead_letter_enabled = config_manager.DEAD_LETTER_QUEUE_ENABLED
+
+        # 重试配置
+        self._retry_enabled = config_manager.EVENT_HANDLER_RETRY_ENABLED
+        self._max_retry_attempts = config_manager.EVENT_HANDLER_MAX_RETRIES
+        self._retry_counts: Dict[str, int] = defaultdict(int)
+
+        self._worker_task = asyncio.create_task(self._process_queue())
+        self._stop_event = asyncio.Event()
+        self._max_queue_size = max_queue_size
+
+    def subscribe(self, handler: Callable) -> int:
+        """订阅事件，返回订阅ID"""
+        self._subscribers.append(handler)
+        handler_name = getattr(handler, '__name__', repr(handler))
+        logger.debug(f"[EventBus] Subscribed {handler_name}, total handlers: {len(self._subscribers)}")
+        return len(self._subscribers) - 1
+
+    def add_failure_callback(self, callback: Callable[[Event, Exception], None]):
+        """添加失败回调，当处理器抛出异常时会被调用"""
+        self._failure_callbacks.append(callback)
+        logger.debug(f"[EventBus] Added failure callback, total: {len(self._failure_callbacks)}")
+        return len(self._failure_callbacks) - 1
+
+    def unsubscribe(self, subscription_id: int) -> bool:
+        """取消订阅"""
+        if 0 <= subscription_id < len(self._subscribers):
+            self._subscribers[subscription_id] = None
+            logger.debug(f"[EventBus] Unsubscribed {subscription_id}")
+            return True
+        return False
+
+    def remove_failure_callback(self, callback_id: int) -> bool:
+        """移除失败回调"""
+        if 0 <= callback_id < len(self._failure_callbacks):
+            self._failure_callbacks[callback_id] = None
+            return True
+        return False
+
+    async def publish(self, event: Event, block: bool = True, timeout: Optional[float] = None) -> bool:
+        """
+        发布事件
+        """
+        logger.debug(f"[EventBus] Publishing event {event.event_type.value} for task {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        try:
+            if block:
+                if timeout is None:
+                    logger.debug(f"[EventBus] About to put event in queue, size={self._queue.qsize()}")
+                    await self._queue.put(event)
+                    logger.debug(f"[EventBus] Event put in queue, size={self._queue.qsize()}")
+                else:
+                    await asyncio.wait_for(self._queue.put(event), timeout=timeout)
+            else:
+                self._queue.put_nowait(event)
+            logger.info(f"[EventBus] Event published: {event.event_type.value} for {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+            return True
+        except asyncio.QueueFull:
+            logger.warning(f"[EventBus] Queue is full, dropping event {event.event_type.value}")
+            # 即使队列满，也尝试将事件放入死信队列
+            if self._dead_letter_enabled:
+                try:
+                    await self._dead_letter_queue.put((event, "queue_full"))
+                except asyncio.QueueFull:
+                    logger.error("[EventBus] Dead letter queue is also full, event permanently lost")
+            return False
+        except asyncio.TimeoutError:
+            logger.warning(f"[EventBus] Publish timeout for event {event.event_type.value}")
+            return False
+
+    async def _process_queue(self):
+        while not self._stop_event.is_set():
+            try:
+                event = await asyncio.wait_for(self._queue.get(), timeout=config_manager.QUEUE_TIMEOUT)
+            except asyncio.TimeoutError:
+                continue
+
+            # 检查毒丸事件
+            if event is None:
+                break
+
+            logger.info(f"[EventBus] Processing event {event.event_type.value} for task {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}, handlers: {len(self._subscribers)}")
+
+            # 处理 STEP_READY 事件（特殊日志）
+            if event.event_type.value == "step_ready":
+                logger.info(f"[EventBus] STEP_READY event for step {event.step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+            # 处理事件（带重试机制）
+            await self._process_event_with_retry(event)
+            logger.debug(f"[EventBus] Finished processing event {event.event_type.value}")
+
+            self._queue.task_done()
+
+    async def _process_event_with_retry(self, event: Event):
+        """处理事件，带重试机制"""
+        handler_results = []
+
+        for handler in self._subscribers:
+            if handler is None:
+                continue
+
+            handler_name = getattr(handler, '__name__', repr(handler))
+            print(f"[DEBUG] EventBus: Calling handler {handler_name} for event {event.event_type.value}")
+            logger.debug(f"[EventBus] Calling handler {handler_name} for event {event.event_type.value}")
+            success = False
+
+            # 如果启用重试，对每个处理器独立重试
+            if self._retry_enabled:
+                max_attempts = self._max_retry_attempts
+            else:
+                max_attempts = 1
+
+            for attempt in range(max_attempts):
+                try:
+                    await handler(event)
+                    success = True
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    logger.error(f"[EventBus] Handler {handler_name} failed on attempt {attempt + 1}/{max_attempts}: {e}", exc_info=True)
+                    self._retry_counts[event.event_id] += 1
+
+                    # 调用失败回调
+                    for cb in self._failure_callbacks:
+                        if cb is not None:
+                            try:
+                                cb(event, e)
+                            except Exception:
+                                pass
+
+                    if attempt < max_attempts - 1:
+                        # 重试间隔（指数退避）
+                        retry_delay = 0.1 * (2 ** attempt)
+                        await asyncio.sleep(retry_delay)
+
+            # 如果所有重试都失败
+            if not success:
+                logger.error(f"[EventBus] Handler {handler_name} failed after {max_attempts} attempts")
+
+                # 记录失败结果
+                final_error = None
+                for cb in self._failure_callbacks:
+                    if cb is not None:
+                        try:
+                            # 重新尝试调用以获取错误
+                            await handler(event)
+                        except Exception as e:
+                            final_error = e
+
+                handler_results.append({
+                    "handler": handler_name,
+                    "success": False,
+                    "error": final_error,
+                    "retry_count": self._retry_counts[event.event_id]
+                })
+
+                # 将事件放入死信队列
+                if self._dead_letter_enabled:
+                    try:
+                        await self._dead_letter_queue.put((event, f"handler_failed:{handler_name}:{final_error}"))
+                        logger.info(f"[EventBus] Event {event.event_id[:8]} moved to dead letter queue")
+                    except asyncio.QueueFull:
+                        logger.error("[EventBus] Dead letter queue is full, event permanently lost")
+
+            # 清理重试计数（事件处理完成）
+            if event.event_id in self._retry_counts:
+                del self._retry_counts[event.event_id]
+
+    def get_queue_size(self) -> int:
+        """获取队列当前大小（用于监控）"""
+        return self._queue.qsize() if hasattr(self._queue, 'qsize') else -1
+
+    def get_dead_letter_count(self) -> int:
+        """获取死信队列大小"""
+        return self._dead_letter_queue.qsize() if hasattr(self._dead_letter_queue, 'qsize') else -1
+
+    async def _safe_run(self, handler: Callable, event: Event) -> Optional[Exception]:
+        """保留此方法以保持向后兼容，但已不再使用"""
+        handler_name = getattr(handler, '__name__', repr(handler))
+        logger.debug(f"[EventBus] Calling handler {handler_name} for event {event.event_type.value}")
+        try:
+            await handler(event)
+            return None
+        except Exception as e:
+            logger.error(f"[EventBus] Handler {handler_name} failed: {e}", exc_info=True)
+            for cb in self._failure_callbacks:
+                if cb is not None:
+                    try:
+                        cb(event, e)
+                    except Exception:
+                        pass
+            return e
+
+    async def shutdown(self):
+        """
+        优雅关闭 EventBus
+        """
+        # 先标记停止，避免新的事件进入
+        self._stop_event.set()
+
+        # 等待队列处理完现有事件
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=config_manager.BUS_SHUTDOWN_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("[EventBus] Queue drain timeout, sending poison pill anyway")
+
+        # 发送毒丸事件（使用 put_nowait，因为队列应该有空间了）
+        try:
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            logger.warning("[EventBus] Queue is full, forced to send poison pill")
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                logger.error("[EventBus] Queue is completely full, poison pill dropped")
+        except RuntimeError:
+            logger.warning("[EventBus] Queue closed, skipping poison pill")
+
+        try:
+            await asyncio.wait_for(self._worker_task, timeout=config_manager.BUS_SHUTDOWN_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("[EventBus] Shutdown timeout, forcing exit")
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
+
+
+# =========================
+# 调度器（纯事件驱动：只响应终端事件）
+# =========================
+class Scheduler:
+    """
+    调度器 - 只响应终端事件（TASK_COMPLETED/TASK_FAILED），不发布新事件
+    完全纯事件驱动：只更新内部状态，不发布任何事件
+    """
+
+    def __init__(self, store: EventStore):
+        self.store = store
+        self._completion_futures: Dict[str, asyncio.Future] = {}
+        self._stop_event = asyncio.Event()
+        self._state_lock = asyncio.Lock()
+
+    async def on_event(self, event: Event):
+        """
+        纯事件处理：只更新内部状态，不发布新事件
+        """
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[Scheduler] Received {event.event_type.value} for {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+        # 终端事件处理
+        if event.event_type in (EventType.TASK_COMPLETED, EventType.TASK_FAILED):
+            proj = self.store.get_projection(event.task_id)
+            if proj:
+                logger.info(f"[Scheduler] TASK_COMPLETED: proj_id={id(proj)}, total_steps={len(proj.steps)}, is_terminal={proj.is_terminal}, steps={list(proj.steps.keys())}")
+                # 检查是否所有步骤都已完成
+                all_completed = all(
+                    sid in proj.completed or sid in proj.failed_steps
+                    for sid in proj.steps.keys()
+                )
+                if not all_completed:
+                    logger.warning(f"[Scheduler] TASK_COMPLETED ignored: not all steps completed, pending steps: {[sid for sid in proj.steps.keys() if sid not in proj.completed and sid not in proj.failed_steps]}")
+                    # 不打印最终摘要，不设置 completion future
+                    return
+                # 只有所有步骤都完成后，才设置 completion future
+                fut = self._completion_futures.get(event.task_id)
+                if fut and not fut.done():
+                    fut.set_result(event.event_type)
+                    logger.debug(f"[Scheduler] Completion future set: {event.event_type.value}")
+                proj.print_final_summary()
+            async with self._state_lock:
+                self._completion_futures.pop(event.task_id, None)
+            return
+
+        # STEP_CLAIMED 事件处理
+        if event.event_type == EventType.STEP_CLAIMED:
+            return
+
+        # STEP_COMPLETED 事件处理
+        if event.event_type == EventType.STEP_COMPLETED:
+            proj = self.store.get_projection(event.task_id)
+            if proj and event.payload.get("is_terminal"):
+                # 验证所有步骤确实已完成
+                all_completed = all(
+                    sid in proj.completed or sid in proj.failed_steps
+                    for sid in proj.steps.keys()
+                )
+                if all_completed:
+                    logger.debug(f"[Scheduler] Task {event.task_id[:config_manager.UUID_TRUNC_LENGTH]} marked terminal, EventStore will complete it")
+                else:
+                    logger.warning(f"[Scheduler] Task {event.task_id[:config_manager.UUID_TRUNC_LENGTH]} marked terminal but not all steps completed")
+            return
+
+        # 其他事件只记录日志
+        if event.event_type == EventType.DAG_UPDATED:
+            logger.debug(f"[Scheduler] DAG updated for {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        elif event.event_type == EventType.STEP_READY:
+            pass  # 只记录日志
+
+    def register_completion(self, task_id: str, future: asyncio.Future):
+        """注册任务完成回调"""
+        self._completion_futures[task_id] = future
+
+    async def shutdown(self):
+        """关闭调度器"""
+        self._stop_event.set()
+
+
+# =========================
+# DAG 扩展器（纯事件驱动）
+# =========================
+class StepExecutionResult:
+    """步骤执行结果 - 包含事件 payload 和需要创建的新步骤"""
+
+    def __init__(
+        self,
+        is_complete: bool,
+        step_completed_payload: Dict,
+        new_steps: Optional[List[Dict]] = None
+    ):
+        self.is_complete = is_complete
+        self.step_completed_payload = step_completed_payload
+        self.new_steps = new_steps or []
+        self.created_step_ids = [s["step_id"] for s in self.new_steps]
+
+
+class DAGExtenderHandler:
+    """
+    DAG 扩展器 - 作为独立事件处理器订阅 STEP_COMPLETED 事件
+
+    职责：
+    1. 订阅 STEP_COMPLETED 事件
+    2. 解析步骤执行结果
+    3. 决定是否需要创建新步骤
+    4. 发布 DAG_UPDATED 事件
+
+    无状态设计，通过事件机制与 Worker 解耦
+    """
+
+    def __init__(self, store: EventStore, bus: Any, tool_registry: ToolRegistry, skill_registry: SkillRegistry):
+        self.store = store
+        self.bus = bus
+        self.tool_registry = tool_registry
+        self.skill_registry = skill_registry
+        self._subscription_id: Optional[int] = None
+
+    async def on_step_completed(self, event: Event):
+        """
+        订阅 STEP_COMPLETED 事件，负责 DAG 扩展
+        """
+        logger.info(f"[DAGExtender] on_step_completed called for event type {event.event_type.value}, step_id={event.step_id}")
+        # 添加日志以诊断
+        logger.info(f"[DAGExtender] on_step_completed: task_id={event.task_id[:8]}, step_id={event.step_id[:8] if event.step_id else None}")
+        if event.event_type != EventType.STEP_COMPLETED:
+            return
+
+        tid = event.task_id
+        sid = event.step_id
+        proj = self.store.get_projection(tid)
+
+        if not proj or not sid:
+            logger.debug(f"[DAGExtender] Invalid event, proj={proj is not None}, sid={sid}")
+            return
+
+        logger.info(f"[DAGExtender] Processing STEP_COMPLETED for {sid[:config_manager.UUID_TRUNC_LENGTH]}")
+
+        # 解析步骤执行结果
+        result = {
+            "next_steps": event.payload.get("next_steps", []),
+            "next_step": event.payload.get("next_step", "done"),
+            "is_terminal": event.payload.get("is_terminal", False),
+            "output": event.payload.get("output", ""),
+            "created_steps": event.payload.get("created_steps", []),
+            "delta": event.payload.get("delta", {}),
+        }
+
+        # 处理 DAG 扩展
+        logger.info(f"[DAGExtender] Calling _process_step_result for step {sid[:8]}, result keys: {list(result.keys())}")
+        extension_result = self._process_step_result(tid, sid, result, proj)
+        logger.info(f"[DAGExtender] _process_step_result returned: is_complete={extension_result.is_complete}, new_steps={len(extension_result.new_steps)}")
+
+        # 直接添加新步骤
+        # 注意：这在 append_and_publish 的锁外执行，所以需要在 append_and_publish 中重新检查完成状态
+        if extension_result.new_steps:
+            logger.info(f"[DAGExtender] Creating {len(extension_result.new_steps)} new steps: {extension_result.new_steps}, only_complete={extension_result.is_complete}")
+            await self.store._add_steps_sync(tid, extension_result.new_steps, event.timestamp, bus=self.bus)
+        else:
+            logger.debug(f"[DAGExtender] No new steps to create, only_complete={extension_result.is_complete}")
+
+        # 如果有新步骤创建但 is_complete 为 True，说明任务还没真正完成
+        if extension_result.new_steps and extension_result.is_complete:
+            logger.warning(f"[DAGExtender] Task not really complete: has new_steps={len(extension_result.new_steps)} but is_complete=True")
+
+    def _process_step_result(self, task_id: str, step_id: str, result: Dict, proj: TaskProjection) -> StepExecutionResult:
+        """
+        处理步骤执行结果并决定是否扩展 DAG
+
+        Args:
+            task_id: 任务ID
+            step_id: 步骤ID
+            result: 步骤执行结果
+            proj: 任务投影
+
+        Returns:
+            StepExecutionResult - 包含事件 payload 和新步骤列表
+        """
+        logger.info(f"[DAGExtender] _process_step_result called for step {step_id[:8]}, result: next_steps={result.get('next_steps')}, is_terminal={result.get('is_terminal')}, delta_keys={list(result.get('delta', {}).keys())}, tool_requests={result.get('delta', {}).get('tool_requests')}")
+        next_steps = result.get("next_steps", [])
+        single_next = result.get("next_step", "done")
+        if single_next != "done" and single_next not in next_steps:
+            next_steps.append(single_next)
+
+        is_terminal = result.get("is_terminal", False)
+        logger.info(f"[DAGExtender] After parsing: next_steps={next_steps}, is_terminal={is_terminal}")
+
+        # 如果有 next_steps（除了 "done"），说明任务还没完成
+        # 覆盖 is_terminal 为 False，确保 DAG 能够扩展
+        has_next_steps = any(s != "done" for s in next_steps)
+        logger.info(f"[DAGExtender] Processing step result: is_terminal={is_terminal}, next_steps={next_steps}, has_next_steps={has_next_steps}, step_id={step_id[:8]}")
+        if has_next_steps and is_terminal:
+            logger.warning(f"[DAGExtender] Override is_terminal=False: has next_steps={next_steps}")
+            is_terminal = False
+        elif not has_next_steps and not is_terminal:
+            logger.warning(f"[DAGExtender] Warning: no next_steps but is_terminal=False, forcing is_terminal=True")
+            is_terminal = True
+
+        # 构建 STEP_COMPLETED 事件的 payload
+        step_completed_payload = {
+            "output": result.get("output", ""),
+            "next_step": "done" if is_terminal else (next_steps[0] if next_steps else "done"),
+            "is_terminal": is_terminal,
+            "delta": result.get("delta", {}),
+            "created_steps": []
+        }
+
+        # 如果还有更多步骤，检查是否需要创建新步骤
+        new_steps = []
+        if not is_terminal:
+            created_step_types = set()
+            for i, next_step_type in enumerate(next_steps):
+                if next_step_type == "done":
+                    continue
+                if next_step_type in created_step_types:
+                    continue
+                # 检查是否已有相同类型且未完成的步骤（包括 ready_pool 中的）
+                existing_incomplete = [
+                    s.step_id for s in proj.steps.values()
+                    if s.step_type == next_step_type and s.step_id not in proj.completed
+                ]
+                if existing_incomplete:
+                    logger.debug(f"[DAGExtender] Skipping {next_step_type}: existing incomplete steps {existing_incomplete}")
+                    continue
+                created_step_types.add(next_step_type)
+                new_step_id = f"step-{uuid.uuid4().hex[:config_manager.UUID_TRUNC_LENGTH]}"
+                dependencies = result.get("dependencies", [step_id])
+                if not dependencies:
+                    dependencies = [step_id]
+                input_data = {"previous": result.get("output", "")[:config_manager.STEP_OUTPUT_SUMMARY_LEN]}
+                if i > 0:
+                    input_data["branch"] = i
+
+                # 处理 tool_requests：为每个工具请求创建独立的 tool 步骤
+                tool_requests = result.get("delta", {}).get("tool_requests", [])
+                if next_step_type == "tool":
+                    # 创建 tool 步骤
+                    if tool_requests:
+                        # 有 tool_requests，为每个请求创建独立的 tool 步骤
+                        for tool_req in tool_requests:
+                            tool_step_id = f"step-{uuid.uuid4().hex[:config_manager.UUID_TRUNC_LENGTH]}"
+                            tool_input = {
+                                "tool_name": tool_req.get("tool_name"),
+                                "tool_args": tool_req.get("tool_args", {}),
+                                "previous": result.get("output", "")[:config_manager.STEP_OUTPUT_SUMMARY_LEN]
+                            }
+                            tool_step = StepDefine(
+                                step_id=tool_step_id,
+                                step_type="tool",
+                                input_data=tool_input,
+                                dependencies=dependencies
+                            )
+                            new_steps.append(tool_step.__dict__)
+                        logger.debug(f"[DAGExtender] Creating {len(tool_requests)} tool steps from tool_requests")
+                    else:
+                        # 没有 tool_requests，创建一个空的 tool 步骤（会被 Worker 跳过）
+                        # 或者直接跳过，因为没有工具可以执行
+                        logger.debug(f"[DAGExtender] Skipping tool step: no tool_requests in result")
+                        continue
+                else:
+                    # 普通步骤
+                    new_step = StepDefine(
+                        step_id=new_step_id,
+                        step_type=next_step_type,
+                        input_data=input_data,
+                        dependencies=dependencies
+                    )
+                    new_steps.append(new_step.__dict__)
+
+            if new_steps:
+                logger.debug(f"[DAGExtender] Creating {len(new_steps)} new steps: {[s['step_type'] for s in new_steps]}")
+                step_details = [f"{s['step_id'][:config_manager.UUID_TRUNC_LENGTH]}({s['step_type']})" for s in new_steps]
+                logger.debug(f"[DAGExtender] New steps details: {step_details}")
+                step_completed_payload["created_steps"] = [s["step_id"] for s in new_steps]
+
+        if is_terminal:
+            logger.debug(f"[DAGExtender] Last step completed, waiting for Scheduler to complete task")
+        else:
+            logger.debug(f"[DAGExtender] Step completed, more steps may follow")
+
+        return StepExecutionResult(is_terminal, step_completed_payload, new_steps)
+
+# =========================
+# Worker（纯事件驱动：订阅 STEP_READY 事件）
+# =========================
+class Worker:
+    def __init__(
+        self,
+        wid: str,
+        store: EventStore,
+        bus: Any,
+        llm_client: AsyncOpenAI,
+        search_tool: SearchToolProtocol,
+        tool_registry: Optional[ToolExecutorProtocol] = None,
+        skill_registry: Optional[SkillExecutorProtocol] = None
+    ):
+        self.wid = wid
+        self.store = store
+        self.bus = bus
+        self.llm = llm_client
+        self.search_tool = search_tool
+        self.tool_registry = tool_registry or ToolRegistry()
+        self.skill_registry = skill_registry or SkillRegistry()
+        self._running = True
+        self._bus_subscription_id: Optional[int] = None
+        self._default_tools_registered = False
+        self.dag_extender: Optional[DAGExtenderHandler] = None
+        # 异步任务跟踪
+        self._background_tasks: Set[asyncio.Task] = set()
+
+    def _register_default_tools(self):
+        """注册默认工具（仅在 run() 中调用，确保 search_tool 已初始化）"""
+        if self._default_tools_registered:
+            return
+        self.tool_registry.register(
+            name="tavily_search",
+            func=self._default_search_tool,
+            description="使用 Tavily 进行网络搜索，获取最新信息",
+            params_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索查询"},
+                    "max_results": {"type": "integer", "default": 5, "description": "最大结果数"}
+                },
+                "required": ["query"]
+            }
+        )
+        self._default_tools_registered = True
+
+    async def _default_search_tool(self, query: str, max_results: int = 5, **kwargs) -> Dict:
+        """默认 Tavily 搜索工具包装器"""
+        return await self.search_tool.search(query=query, max_results=max_results)
+
+    def stop(self):
+        self._running = False
+        if self._bus_subscription_id is not None:
+            # 取消订阅 STEP_READY 事件
+            self.bus.unsubscribe(self._bus_subscription_id)
+            logger.debug(f"[{self.wid}] Unsubscribed from STEP_READY events")
+            self._bus_subscription_id = None
+
+    async def run(self):
+        logger.debug(f"[{self.wid}] Worker started")
+
+        # DAGExtenderHandler 由 ProductionAgentOS 创建并注入，这里只需初始化
+        self.dag_extender = None
+
+        # 注册默认工具
+        self._register_default_tools()
+
+        # 订阅 STEP_READY 事件（直接通过 bus）
+        self._bus_subscription_id = self.bus.subscribe(self._on_step_ready)
+
+        try:
+            while self._running:
+                await asyncio.sleep(0.1)
+                # 定期清理已完成的后台任务
+                self._cleanup_finished_tasks()
+        finally:
+            # 等待所有后台任务完成
+            if self._background_tasks:
+                logger.debug(f"[{self.wid}] Waiting for {len(self._background_tasks)} background tasks to complete")
+                try:
+                    await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                except Exception as e:
+                    logger.warning(f"[{self.wid}] Error waiting for background tasks: {e}")
+            logger.debug(f"[{self.wid}] Worker shut down")
+
+    def _cleanup_finished_tasks(self):
+        """清理已完成的后台任务（可在同步上下文中调用）"""
+        finished = []
+        for task in self._background_tasks:
+            if task.done():
+                finished.append(task)
+        for task in finished:
+            self._background_tasks.discard(task)
+
+    async def _on_step_ready(self, event: Event):
+        """
+        纯事件驱动：监听 STEP_READY 事件，竞争执行步骤
+        """
+        print(f"[DEBUG] _on_step_ready: event_type={event.event_type}, step_id={event.step_id}")
+        if event.event_type != EventType.STEP_READY:
+            print(f"[DEBUG] _on_step_ready: skipping non-STEP_READY event")
+            return
+
+        # 检查 step_id 是否存在
+        if not event.step_id:
+            logger.warning(f"[{self.wid}] STEP_READY event missing step_id, skipping")
+            return
+
+        logger.debug(f"[{self.wid}] _on_step_ready called for {event.step_id[:config_manager.UUID_TRUNC_LENGTH]} (event_type={event.event_type})")
+
+        proj = self.store.get_projection(event.task_id)
+        if not proj:
+            logger.warning(f"[{self.wid}] Projection not found for {event.task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+            return
+        if event.step_id not in proj.ready_pool:
+            logger.warning(f"[{self.wid}] Step {event.step_id[:config_manager.UUID_TRUNC_LENGTH]} not in ready_pool, skipping")
+            return
+
+        logger.info(f"[{self.wid}] Step {event.step_id[:config_manager.UUID_TRUNC_LENGTH]} ready, attempting claim...")
+        # 尝试 claim 步骤（多 Worker 竞争）
+        # try_claim_step 现在在锁内发布 STEP_CLAIMED 事件并返回 None
+        logger.debug(f"[{self.wid}] Calling try_claim_step for {event.step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        await self.store.try_claim_step(event.task_id, event.step_id, self.wid, self.bus)
+        logger.debug(f"[{self.wid}] try_claim_step returned for {event.step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        print(f"[DEBUG] Creating task for _process_step_event of {event.step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        task = asyncio.create_task(self._process_step_event(event.task_id, event.step_id))
+        self._background_tasks.add(task)
+        # 使用 add_done_callback 在任务完成时自动清理
+        task.add_done_callback(lambda t: self._background_tasks.discard(t))
+        print(f"[DEBUG] Task created for {event.step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+
+    async def _process_step_event(self, task_id: str, step_id: str) -> bool:
+        """
+        处理步骤执行事件
+        """
+        print(f"[DEBUG] _process_step_event called for {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        proj = None
+        step = None
+
+        try:
+            print(f"[DEBUG] Getting projection for {task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+            proj = self.store.get_projection(task_id)
+            print(f"[DEBUG] proj.is_terminal = {proj.is_terminal}")
+            if not proj:
+                raise TaskNotFoundException(f"Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} projection not found")
+            if proj.is_terminal:
+                print(f"[DEBUG] Task is terminal, skipping step {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+                logger.debug(f"[{self.wid}] Task {task_id[:config_manager.UUID_TRUNC_LENGTH]} is terminal, skipping step {step_id[:config_manager.UUID_TRUNC_LENGTH]}")
+                return False
+
+            # 检查步骤是否在 running 状态（被成功 claim）
+            step_state = proj._step_states.get(step_id)
+            print(f"[DEBUG] State check for {step_id[:config_manager.UUID_TRUNC_LENGTH]}: state={step_state}")
+            logger.debug(f"[{self.wid}] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} state check: {step_state} (expected: running)")
+            if step_state != "running":
+                print(f"[DEBUG] Skipping {step_id[:config_manager.UUID_TRUNC_LENGTH]} because state is {step_state}, not running")
+                logger.warning(f"[{self.wid}] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} not in running state (state={step_state}), skipping execution")
+                return False
+
+            step = proj.steps.get(step_id)
+            if not step:
+                raise StepNotFoundException(f"Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} not found in steps")
+
+            logger.info(f"[{self.wid}] Executing step {step_id[:config_manager.UUID_TRUNC_LENGTH]} ({step.step_type})")
+            start_time = time.time()
+
+            if self.llm is None:
+                raise Exception(f"LLM client not initialized for worker {self.wid}")
+            if self.search_tool is None:
+                raise Exception(f"Search tool not initialized for worker {self.wid}")
+
+            try:
+                result = await asyncio.wait_for(
+                    self._execute_llm(task_id, step_id, step, proj),
+                    timeout=config_manager.STEP_EXECUTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[{self.wid}] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} timeout, publishing STEP_FAILED")
+                await self.store.append_and_publish(Event(
+                    task_id=task_id,
+                    step_id=step_id,
+                    event_type=EventType.STEP_FAILED,
+                    payload={"error": "timeout"}
+                ), self.bus)
+                raise ExecutionTimeoutException(f"Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} LLM timeout")
+            except Exception as e:
+                raise Exception(f"LLM execution failed: {e}")
+
+            # Worker 不再负责 DAG 扩展，只构建并发布 STEP_COMPLETED 事件
+            # DAG 扩展逻辑由 DAGExtenderHandler 通过订阅 STEP_COMPLETED 事件处理
+
+            # 构建 STEP_COMPLETED 事件的 payload（包含完整的执行结果）
+            completed_payload = {
+                "output": result.get("output", ""),
+                "next_step": result.get("next_step", "done"),
+                "next_steps": result.get("next_steps", []),
+                "is_terminal": result.get("is_terminal", False),
+                "reasoning": result.get("reasoning", ""),
+                "delta": result.get("delta", {}),
+                "created_steps": [],  # 由 DAGExtenderHandler 填充
+            }
+
+            await self.store.append_and_publish(Event(
+                task_id=task_id,
+                step_id=step_id,
+                event_type=EventType.STEP_COMPLETED,
+                payload=completed_payload
+            ), self.bus)
+
+            total_time = time.time() - start_time
+            logger.debug(f"[{self.wid}] Step {step_id[:config_manager.UUID_TRUNC_LENGTH]} completed in {total_time:.1f}s")
+            return True
+
+        except AgentOSException:
+            raise
+        except Exception as e:
+            logger.error(f"[{self.wid}] Exception processing step {step_id[:config_manager.UUID_TRUNC_LENGTH]}: {e}", exc_info=True)
+            raise
+        finally:
+            # 从后台任务集合中移除
+            current_task = asyncio.current_task()
+            if current_task and current_task in self._background_tasks:
+                self._background_tasks.discard(current_task)
+
+    async def _execute_llm(self, task_id: str, step_id: str, step: StepDefine, proj: TaskProjection) -> Dict:
+        """统一执行接口：使用 _execute_with_tools"""
+        step_type = step.step_type
+
+        if step_type == "search":
+            return await self._execute_search(step, proj)
+
+        if step_type == "tool":
+            return await self._execute_tool(step, proj)
+
+        available_tools = self.tool_registry.get_available_tools()
+        available_skills = self.skill_registry.get_available_skills()
+        return await self._execute_with_tools(task_id, step_id, step, proj, available_tools, available_skills)
+
+    async def _build_context(self, step: StepDefine, proj: TaskProjection) -> str:
+        """构建 LLM 上下文信息（提取公共逻辑）"""
+        dep_results = {}
+        for dep_id in step.dependencies:
+            record = proj.get_step_record(dep_id)
+            if record and record.get("status") == "completed":
+                dep_results[dep_id] = record.get("output", "")[:config_manager.STEP_OUTPUT_CONTEXT_LEN]
+
+        all_completed = []
+        for record in proj.step_records:
+            if record.get("status") == "completed" and record["step_id"] not in dep_results:
+                all_completed.append({
+                    "step_id": record["step_id"],
+                    "step_type": record["step_type"],
+                    "output": record.get("output", "")[:config_manager.STEP_OUTPUT_SHORT_LEN],
+                    "completed_at": record.get("completed_at", 0)
+                })
+        all_completed.sort(key=lambda x: x["completed_at"], reverse=True)
+        recent_context = all_completed[:3]
+
+        context_parts = []
+        if dep_results:
+            context_parts.append("=== Direct Dependencies ===")
+            for dep_id, output in dep_results.items():
+                short_id = dep_id[:config_manager.UUID_TRUNC_LENGTH]
+                context_parts.append(f"[{short_id}]: {output[:config_manager.STEP_OUTPUT_CONTEXT_LEN]}")
+        if recent_context:
+            context_parts.append("\n=== Additional Context ===")
+            for ctx in recent_context:
+                short_id = ctx["step_id"][:config_manager.UUID_TRUNC_LENGTH]
+                context_parts.append(f"[{short_id} {ctx['step_type']}]: {ctx['output'][:config_manager.STEP_OUTPUT_SUMMARY_LEN]}")
+        return "\n".join(context_parts) if context_parts else "No previous context available."
+
+    async def _execute_search(self, step: StepDefine, proj: TaskProjection) -> Dict:
+        """执行 Tavily 搜索"""
+        search_query = step.input_data.get("query", step.input_data.get("task", proj.task_text))
+        current_date = time.strftime('%Y 年%m 月%d 日', time.localtime())
+
+        logger.debug(f"[{self.wid}] Executing search: {search_query[:50]}...")
+        start_time = time.time()
+
+        try:
+            results = await self.search_tool.search(
+                query=search_query,
+                max_results=5,
+                search_depth="basic",
+                include_answer=True
+            )
+
+            search_time = time.time() - start_time
+            logger.debug(f"[{self.wid}] Search completed in {search_time:.1f}s, found {len(results.get('results', []))} results")
+
+            formatted_results = self.search_tool.format_results(results)
+
+            all_future_steps = [
+                s.step_type for s in proj.steps.values()
+                if s.step_id not in proj.completed and s.step_id not in proj.running
+            ]
+            has_next_steps = any(
+                s_type in ["research", "think", "analyze", "answer", "summarize"]
+                for s_type in all_future_steps
+            )
+
+            # 格式化结果（带详细异常处理）
+            try:
+                formatted_results = self.search_tool.format_results(results)
+            except NameError as ne:
+                logger.error(f"[{self.wid}] NameError in format_results: {ne}", exc_info=True)
+                var_name = str(ne).split("'")[1] if "'" in str(ne) else "unknown"
+                formatted_results = f"搜索结果格式化失败：变量 {var_name} 未定义"
+            except Exception as format_e:
+                logger.error(f"[{self.wid}] Format error: {format_e}", exc_info=True)
+                formatted_results = f"搜索结果格式化失败：{str(format_e)}"
+
+            return {
+                "output": f"【搜索时间】{current_date}\n\n{formatted_results}",
+                "next_step": "analyze" if has_next_steps else "done",
+                "is_terminal": not has_next_steps,
+                "next_steps": ["analyze"] if has_next_steps else []
+            }
+        except Exception as e:
+            logger.error(f"[{self.wid}] Search failed: {e}", exc_info=True)
+            return {
+                "output": f"搜索失败：{str(e)}",
+                "next_step": "analyze",
+                "is_terminal": False,
+                "next_steps": ["analyze"]
+            }
+
+    async def _execute_tool(self, step: StepDefine, proj: TaskProjection) -> Dict:
+        """执行指定的工具（type="tool" 的步骤）"""
+        tool_name = step.input_data.get("tool_name")
+        tool_args = step.input_data.get("tool_args", {})
+
+        if not tool_name:
+            logger.error(f"Tool step missing tool_name: {step.__dict__}")
+            return {
+                "output": "错误：tool 步骤缺少 tool_name",
+                "next_step": "done",
+                "is_terminal": True
+            }
+
+        logger.info(f"[{self.wid}] Executing tool: {tool_name}")
+        start_time = time.time()
+
+        try:
+            tool_result = await self.tool_registry.execute(tool_name, tool_args)
+            exec_time = time.time() - start_time
+            logger.debug(f"[{self.wid}] Tool {tool_name} completed in {exec_time:.1f}s")
+
+            return {
+                "output": f"【工具结果】\n{tool_result}",
+                "next_steps": ["analyze"],  # 工具执行完成后创建 analyze 步骤
+                "is_terminal": False
+            }
+        except Exception as e:
+            logger.error(f"[{self.wid}] Tool '{tool_name}' execution failed: {e}", exc_info=True)
+            return {
+                "output": f"工具执行失败: {tool_name} - {str(e)}",
+                "next_steps": ["analyze"],  # 工具执行失败后创建 analyze 步骤
+                "is_terminal": False
+            }
+
+    async def _execute_with_tools(
+        self,
+        task_id: str,
+        step_id: str,
+        step: StepDefine,
+        proj: TaskProjection,
+        available_tools: List[Dict],
+        available_skills: List[Dict]
+    ) -> Dict:
+        """使用工具的 LLM 调用（Modern Agent 模式）"""
+        step_type = step.step_type
+        step_index = step.input_data.get("step_index", 0)
+        total_steps = step.input_data.get("total_steps", 1)
+
+        full_context = await self._build_context(step, proj)
+        current_date = time.strftime('%Y年%m月%d日', time.localtime())
+
+        tools_desc = []
+        for tool in available_tools:
+            func_info = tool.get("function", {})
+            tools_desc.append(f"- {func_info.get('name')}: {func_info.get('description')}")
+
+        skills_desc = []
+        for skill in available_skills:
+            skills_desc.append(f"- {skill.get('name')}: {skill.get('description', '')}")
+
+        # 响应格式模板（使用变量避免 f-string 转义问题）
+        response_format = '''{
+    "thought": "你的思考过程",
+    "action": "tool/skill/analyze/direct",
+    "tool_requests": [
+        {"tool_name": "工具名", "tool_args": {"arg1": "值1"}}
+    ],
+    "output": "输出内容",
+    "is_terminal": true/false,
+    "reasoning": "决策理由"
+}'''
+
+        stage_instruction = f"""当前日期：{current_date}
+任务：{proj.task_text}
+步骤：{step_type}（第{step_index + 1}/{total_steps}步）
+
+【可用工具】
+{chr(10).join(tools_desc) if tools_desc else "无可用工具"}
+
+【可用 Skills】
+{chr(10).join(skills_desc) if skills_desc else "无可用 Skills"}
+
+【循环推理模式】
+你可以执行多轮推理，每一轮可以选择：
+1. 调用工具（action="tool"）- 工具结果会自动加入上下文
+2. 直接分析（action="analyze"）- 分析工具结果
+3. 输出最终答案（action="direct"）- 结束任务
+
+规则：
+- 每次可以调用多个工具（在 tool_requests 中列出）
+- 工具执行后会进入下一轮思考
+- 避免重复调用相同的工具（除非参数不同）
+- 当信息已经足够时，必须结束（action="direct" 或 is_terminal=true）
+
+【执行指令】
+根据任务类型选择合适的工具或直接输出分析结果。
+
+上下文信息：
+{full_context}
+
+【响应格式】
+必须返回如下 JSON 格式，不要包含任何开场白：
+{response_format}"""
+
+        prompt = stage_instruction
+
+        try:
+            resp = await self.llm.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "你是一个智能助手。请根据任务选择合适的工具或直接输出答案。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=config_manager.LLM_TEMPERATURE,
+                max_tokens=config_manager.LLM_MAX_TOKENS,
+                response_format={"type": "json_object"}
+            )
+            content = resp.choices[0].message.content
+            logger.debug(f"[{self.wid}] Raw LLM response: {content[:500]}")
+
+            data = {}
+            # 移除 LLM 可能添加的特殊标记（如 】、<|im_end|> 等）
+            clean_content = re.sub(r'】.*$', '', content, flags=re.MULTILINE)
+            clean_content = re.sub(r'<\|im_end\|>.*$', '', clean_content, flags=re.MULTILINE)
+            clean_content = re.sub(r'</think>.*$', '', clean_content, flags=re.MULTILINE)
+            clean_content = clean_content.strip()
+
+            json_match = re.search(r'(\{.*\})', clean_content, re.DOTALL)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(1))
+                except json.JSONDecodeError:
+                    try:
+                        fixed = json_match.group(1).replace("'", '"')
+                        data = json.loads(fixed)
+                    except:
+                        data = {"output": content}
+
+            if not isinstance(data, dict):
+                data = {"output": str(data), "is_terminal": True}
+
+            action = data.get("action", "direct")
+            tool_requests = data.get("tool_requests", [])
+            tool_name = data.get("tool_name")  # 兼容旧格式
+            skill_name = data.get("skill_name")
+            output = data.get("output", "")
+
+            # 调用工具（支持批量 tool_requests）
+            logger.info(f"[{self.wid}] Parsed data: action={action}, tool_requests={tool_requests}, is_terminal={data.get('is_terminal')}")
+            if action == "tool" and (tool_name or tool_requests):
+                # 兼容旧格式：单个 tool_name
+                if not tool_requests and tool_name:
+                    tool_requests = [{"tool_name": tool_name, "tool_args": data.get("tool_args", {})}]
+
+                logger.debug(f"[{self.wid}] Requesting {len(tool_requests)} tool(s)")
+
+                # 返回工具请求，由 DAGExtender 创建 tool 步骤（并行执行）
+                # 注意：只返回 "tool"，不返回 "analyze"，因为 analyze 应该在所有 tool 完成后执行
+                # 这样可以避免 analyze 步骤返回 tool_requests 时创建无限循环
+                return {
+                    "output": output if output else "需要调用工具",
+                    "next_steps": ["tool"],  # 只创建 tool 步骤，analyze 会在所有 tool 完成后自动执行
+                    "is_terminal": False,
+                    "delta": {
+                        "tool_requests": tool_requests
+                    },
+                    "reasoning": data.get("reasoning", "")
+                }
+
+            # 调用 Skill
+            elif action == "skill" and skill_name:
+                skill_args = data.get("tool_args", {})
+                logger.info(f"[{self.wid}] Calling Skill: {skill_name}")
+                try:
+                    skill_result = await self.skill_registry.execute(skill_name, skill_args)
+                except Exception as e:
+                    logger.error(f"[{self.wid}] Skill '{skill_name}' execution failed: {e}", exc_info=True)
+                    return {
+                        "output": f"Skill 调用失败: {skill_name} - {str(e)}",
+                        "next_step": "analyze",
+                        "is_terminal": False,
+                        "reasoning": f"Skill {skill_name} 执行失败: {str(e)}"
+                    }
+                return {
+                    "output": f"【Skill 结果】\n{skill_result}",
+                    "next_step": "analyze",
+                    "is_terminal": False,
+                    "reasoning": data.get("reasoning", "")
+                }
+
+            # 直接输出或分析
+            else:
+                if not output or str(output).strip() == "":
+                    output = content if content.strip() else "模型未生成有效内容"
+
+                is_terminal = data.get("is_terminal", True)
+                reasoning = data.get("reasoning", "")
+                next_step = data.get("next_step", "done" if is_terminal else "analyze")
+                next_steps = data.get("next_steps", [next_step] if next_step != "done" else [])
+
+                # 使用 LLM 返回的 tool_requests 和 next_steps，不要强制覆盖
+                # is_terminal 应该由 DAGExtender 根据实际步骤状态决定
+                tr = data.get("tool_requests")
+                if tr and len(tr) > 0:
+                    logger.debug(f"[{self.wid}] Has tool_requests: {tr}")
+                else:
+                    logger.debug(f"[{self.wid}] No tool_requests, is_terminal={is_terminal}, next_steps={next_steps}")
+
+                return {
+                    "output": output,
+                    "is_terminal": is_terminal,
+                    "reasoning": reasoning,
+                    "next_step": next_step,
+                    "next_steps": next_steps,
+                    "delta": {
+                        "tool_requests": tr if tr else []
+                    }
+                }
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[{self.wid}] Tool execution failed: {e}", exc_info=True)
+            return {
+                "output": f"执行失败: {str(e)}",
+                "is_terminal": False,
+                "reasoning": f"工具执行失败: {str(e)}",
+                "next_step": "done"
+            }
+
+
+# =========================
+# 主控系统 (Modern Agent 架构)
+# =========================
+class ProductionAgentOS:
+    def __init__(self, worker_count: int = 2, skills_dir: str = "skills"):
+        self.bus = EventBus()
+        self.store = EventStore()
+        self.scheduler = Scheduler(self.store)
+        self.worker_count = worker_count
+        self.workers: List[Worker] = []
+        self.tool_registry = ToolRegistry()
+        self.skill_registry = SkillRegistry()
+        self.dag_extender_handler: Optional[DAGExtenderHandler] = None
+        self.skills_dir = skills_dir
+        self._global_timeout_task: Optional[asyncio.Task] = None
+        self.bus.subscribe(self.scheduler.on_event)
+
+        self._register_skills()
+
+        # 创建 DAGExtenderHandler 并订阅 STEP_COMPLETED 事件
+        self.dag_extender_handler = DAGExtenderHandler(self.store, self.bus, self.tool_registry, self.skill_registry)
+        dag_extender_subscription = self.bus.subscribe(self.dag_extender_handler.on_step_completed)
+        if self.dag_extender_handler:
+            self.dag_extender_handler._subscription_id = dag_extender_subscription
+
+        logger.debug(f"ProductionAgentOS initialized with {worker_count} workers")
+
+    def _register_skills(self):
+        """从目录加载并注册 skills"""
+        try:
+            skills = load_skills_from_directory(self.skills_dir)
+            for skill_name, skill_obj in skills.items():
+                self.skill_registry.register(
+                    name=skill_name,
+                    skill=skill_obj,
+                    description=skill_obj.description
+                )
+            logger.debug(f"[ProductionAgentOS] Registered {len(skills)} skills")
+        except Exception as e:
+            logger.error(f"[ProductionAgentOS] Failed to load skills: {e}")
+
+    def register_tool(self, name: str, func: Callable, description: str, params_schema: Optional[Dict] = None):
+        """注册工具到全局注册中心"""
+        self.tool_registry.register(name, func, description, params_schema)
+        logger.debug(f"[ProductionAgentOS] Registered global tool: {name}")
+
+    def register_skill(self, name: str, skill: Any, description: str = "", params_schema: Optional[Dict] = None):
+        """注册 Skill 到全局注册中心"""
+        self.skill_registry.register(name, skill, description, params_schema)
+        logger.debug(f"[ProductionAgentOS] Registered global skill: {name}")
+
+    def _create_initial_step(self, task: str, task_id: str) -> List[Dict]:
+        """根据任务内容创建初始步骤"""
+        # 检查任务是否明确指定只执行特定操作
+        task_lower = task.lower()
+
+        # 如果任务明确指定只搜索，直接创建 search 步骤
+        if "只搜索" in task or "只search" in task_lower or "搜索" in task_lower and "分析" not in task_lower:
+            initial_step = StepDefine(
+                step_id=f"step-{uuid.uuid4().hex[:config_manager.UUID_TRUNC_LENGTH]}",
+                step_type="search",
+                input_data={"task": task, "phase": "direct_search"},
+                dependencies=[]
+            )
+            logger.info(f"[Workflow] Creating direct search step for task: {task[:50]}...")
+        else:
+            initial_step = StepDefine(
+                step_id=f"step-{uuid.uuid4().hex[:config_manager.UUID_TRUNC_LENGTH]}",
+                step_type="think",
+                input_data={"task": task, "phase": "initial_analysis"},
+                dependencies=[]
+            )
+            logger.info(f"[Workflow] Creating initial think step for task: {task[:50]}...")
+
+        return [initial_step.__dict__]
+
+    async def run(self, task: str, timeout: float = 300.0) -> Dict:
+        """Modern Agent 模式：单次 LLM 调用 + 工具调用"""
+        task_id = str(uuid.uuid4())
+
+        logger.info("=" * 70)
+        logger.info("任务启动 (Modern Agent 模式)")
+        logger.info("=" * 70)
+        logger.info(f"任务 ID: {task_id[:config_manager.UUID_TRUNC_LENGTH]}")
+        logger.info(f"任务描述：{task[:60]}...")
+        logger.info(f"可用工具: {len(self.tool_registry.get_available_tools())} 个")
+        logger.info(f"可用 Skills: {len(self.skill_registry.get_available_skills())} 个")
+        logger.info(f"开始时间：{time.strftime('%H:%M:%S')}")
+        logger.info(f"Workers: {self.worker_count}")
+        logger.info("=" * 70 + "\n")
+
+        # 创建 Worker 时传入共享资源和注册中心
+        llm_client = AsyncOpenAI(
+            base_url=f"{VLLM_URL}/v1",
+            api_key="sk-ignore",
+            timeout=config_manager.LLM_CALL_TIMEOUT
+        )
+        search_tool = TavilySearchTool()
+
+        self.workers = [
+            Worker(f"W-{i}", self.store, self.bus, llm_client, search_tool, self.tool_registry, self.skill_registry)
+            for i in range(self.worker_count)
+        ]
+
+        # 启动 Worker
+        worker_tasks = [asyncio.create_task(w.run()) for w in self.workers]
+
+        await self.store.start_cleanup()
+
+        await asyncio.sleep(0.3)
+
+        completion_future = asyncio.get_running_loop().create_future()
+        self.scheduler.register_completion(task_id, completion_future)
+
+        async def global_timeout():
+            try:
+                await asyncio.sleep(timeout)
+                if not completion_future.done():
+                    logger.error(f"全局超时 {timeout}s，强制结束任务")
+                    await self.store.append_and_publish(Event(
+                        task_id=task_id,
+                        event_type=EventType.TASK_FAILED,
+                        payload={"reason": "global_timeout"}
+                    ), self.bus)
+                    for w in self.workers:
+                        w.stop()
+                    for t in worker_tasks:
+                        t.cancel()
+            except asyncio.CancelledError:
+                pass
+
+        self._global_timeout_task = asyncio.create_task(global_timeout())
+
+        # 创建初始步骤
+        steps_data = self._create_initial_step(task, task_id)
+        logger.debug(f"[Workflow] Created initial step: {[s['step_type'] for s in steps_data]}")
+
+        try:
+            await self.store.append_and_publish(Event(
+                task_id=task_id,
+                event_type=EventType.TASK_SUBMITTED,
+                payload={
+                    "task": task,
+                    "dag": steps_data
+                }
+            ), self.bus)
+        except Exception as e:
+            logger.error(f"Failed to submit task: {e}")
+            try:
+                await self.store.append_and_publish(Event(
+                    task_id=task_id,
+                    event_type=EventType.TASK_FAILED,
+                    payload={"reason": "submit_failed", "error": str(e)}
+                ), self.bus)
+            except Exception:
+                pass
+            for w in self.workers:
+                w.stop()
+            for t in worker_tasks:
+                t.cancel()
+            if self._global_timeout_task:
+                self._global_timeout_task.cancel()
+            return {"task_id": task_id, "status": "submit_failed", "error": str(e), "completed_steps": 0, "total_steps": 0, "duration": 0}
+
+        try:
+            result_status = await asyncio.wait_for(completion_future, timeout=timeout + 5)
+            proj = self.store.get_projection(task_id)
+            result = {
+                "task_id": task_id,
+                "status": result_status.value if hasattr(result_status, 'value') else result_status,
+                "completed_steps": len(proj.completed) if proj else 0,
+                "total_steps": len(proj.steps) if proj else 0,
+                "duration": (proj.end_time - proj.start_time) if proj and proj.end_time else 0
+            }
+            return result
+        except asyncio.TimeoutError:
+            logger.error("任务超时")
+            proj = self.store.get_projection(task_id)
+            if proj:
+                logger.error(f"Final status: {proj.get_status()}")
+            return {
+                "task_id": task_id,
+                "status": "timeout",
+                "completed_steps": len(proj.completed) if proj else 0,
+                "total_steps": len(proj.steps) if proj else 0,
+                "duration": timeout
+            }
+        finally:
+            if self._global_timeout_task:
+                self._global_timeout_task.cancel()
+            await self.scheduler.shutdown()
+            logger.info("Shutting down workers...")
+            for w in self.workers:
+                w.stop()
+            try:
+                await asyncio.wait_for(asyncio.gather(*worker_tasks, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Worker shutdown timeout")
+            await self.bus.shutdown()
+            await self.store.shutdown()
+
+    async def shutdown(self):
+        """Shutdown agent gracefully"""
+        await self.scheduler.shutdown()
+        logger.info("Shutting down workers...")
+        for w in self.workers:
+            w.stop()
+        await self.bus.shutdown()
+        await self.store.shutdown()
+
+    def get_task_status(self, task_id: str) -> Optional[Dict]:
+        """
+        获取任务状态
+
+        Args:
+            task_id: 任务ID
+
+        Returns:
+            任务状态字典，如果任务不存在返回 None
+        """
+        proj = self.store.get_projection(task_id)
+        if not proj:
+            return None
+
+        return {
+            "task_id": task_id,
+            "status": "running" if not proj.is_terminal else ("completed" if proj.end_time else "failed"),
+            "total_steps": len(proj.steps),
+            "completed_steps": len(proj.completed),
+            "failed_steps": len(proj.failed_steps),
+            "running_steps": list(proj.running.keys()),
+            "ready_steps": list(proj.ready_pool),
+            "start_time": proj.start_time,
+            "end_time": proj.end_time,
+            "history": proj.history
+        }
+
+    async def cancel_task(self, task_id: str, reason: str = "user_cancelled") -> bool:
+        """
+        取消进行中的任务
+
+        Args:
+            task_id: 任务ID
+            reason: 取消原因
+
+        Returns:
+            True if task was cancelled, False if task not found or already terminal
+        """
+        return await self.store.cancel_task(task_id, self.bus, reason)
+
+
+# =========================
+# 运行入口
+# =========================
+async def main():
+    # 创建 agent 并加载 skills
+    agent = ProductionAgentOS(worker_count=2, skills_dir="skills")
+
+    # 示例 1：用户指定工作流
+    # task = "只搜索 AH 股溢价相关信息"
+
+    # 示例 2：用户要求只搜索
+    # task = "只搜索 AH 股溢价相关信息"
+
+    # 示例 3：默认模式（让系统自动决定）
+    task = "搜索 AH 股溢价，分析 AH 股溢价对当前市场情绪的影响"
+
+    # 打印可用的 skills
+    logger.info(f"可用 Skills: {agent.skill_registry.get_available_skill_names()}")
+
+    try:
+        result = await agent.run(task, timeout=300)
+        logger.info("=" * 70)
+        logger.info("最终结果")
+        logger.info("=" * 70)
+        logger.info(f"Status: {result['status']}")
+        logger.info(f"Completed: {result['completed_steps']}/{result['total_steps']} steps")
+        logger.info(f"Duration: {result['duration']:.1f}s")
+
+        # 显示步骤详细输出
+        proj = agent.store.get_projection(result["task_id"])
+        if proj:
+            completed_records = [r for r in proj.step_records if r.get("status") == "completed"]
+            for record in completed_records:
+                logger.info("-" * 50)
+                logger.info(f"步骤 {record['phase']}: {record['step_type'].upper()}")
+                output = record.get("output_full") or record.get("output", "")
+                if output:
+                    # 显示前1000字符
+                    logger.info(f"输出内容:\n{output[:1000]}")
+
+        logger.info("=" * 70)
+    except Exception as e:
+        logger.error(f"错误：{e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
