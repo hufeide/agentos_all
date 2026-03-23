@@ -129,8 +129,19 @@ class EventBus:
             except Exception as e:
                 logger.error(f"事件队列处理异常：{e}")
 
-    async def shutdown(self):
-        """关闭事件总线"""
+    async def shutdown(self, wait_queue: bool = True):
+        """关闭事件总线
+
+        Args:
+            wait_queue: 如果为 True，等待队列中所有事件处理完成后再退出
+        """
+        if wait_queue:
+            # 等待队列中所有事件处理完成
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("队列清理超时，强制关闭")
+
         self._stop_event.set()
         await self._queue.put(None)
         if self._worker_task:
