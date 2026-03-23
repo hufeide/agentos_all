@@ -320,6 +320,19 @@ class ToolRegistry:
         except Exception as e:
             return f"错误：工具 '{tool_name}' 执行失败: {str(e)}"
 
+    async def execute_sub_planner(self, task: str, llm: AsyncOpenAI, tools: List[Dict]) -> Dict[str, Any]:
+        """子规划工具：根据任务生成子 DAG"""
+        logger.info(f"[ToolRegistry] SubPlanner executing for task: {task[:50]}...")
+        planner = PlannerV3(llm)
+        plan = await planner.plan(task, tools)
+        return {
+            "sub_plan_task": task,
+            "sub_plan_id": plan.plan_id,
+            "sub_step_count": len(plan.steps),
+            "sub_steps": list(plan.steps.keys()),
+            "status": "planned"
+        }
+
 # =========================
 # Skill 注册中心
 # =========================
@@ -701,7 +714,7 @@ class WorkerV3:
             if artifact is None and self.engine and self.engine.state:
                 # fallback 到 Engine 的 state.artifacts
                 artifact = self.engine.state.artifacts.get(dep_id)
-            if artifact:
+            if artifact is not None:
                 artifacts[f"_dep_{dep_id}"] = artifact
         return artifacts
 
@@ -711,6 +724,13 @@ class WorkerV3:
         try:
             if step.step_type == "tool":
                 result = await self.tool_registry.execute(step.tool_name or "tavily_search", step.tool_args)
+            elif step.step_type == "sub_planner":
+                # 执行子规划工具，生成子 DAG
+                result = await self.tool_registry.execute_sub_planner(
+                    task=step.input_data.get("task", ""),
+                    llm=self.llm,
+                    tools=self.tool_registry.get_available_tools()
+                )
             elif step.step_type == "search":
                 result = await self._execute_search(step)
             elif step.step_type == "analyze":
@@ -748,7 +768,7 @@ class WorkerV3:
         artifacts = await self._get_dependency_artifacts(step)
         for dep_id in step.depends_on:
             artifact = artifacts.get(f"_dep_{dep_id}")
-            if artifact:
+            if artifact is not None:
                 context_parts.append(f"[{dep_id}]: {str(artifact)[:500]}")
         context = "\n\n".join(context_parts)
         prompt = f"分析以下内容：\n{context}\n\n请给出你的分析和见解。"
@@ -768,7 +788,7 @@ class WorkerV3:
         artifacts = await self._get_dependency_artifacts(step)
         for dep_id in step.depends_on:
             artifact = artifacts.get(f"_dep_{dep_id}")
-            if artifact:
+            if artifact is not None:
                 context_parts.append(f"[{dep_id}]: {str(artifact)[:500]}")
         context = "\n\n".join(context_parts)
 
@@ -820,7 +840,13 @@ class WorkerV3:
     async def _execute_with_retry(self, step: StepV3) -> Tuple[bool, Any]:
         """
         带重试机制的执行方法 - 现在统一调用 execute
+        注意：sub_planner 步骤的重试由 PlannerV3 内部处理，这里不额外重试
         """
+        # 对于 sub_planner 步骤，不使用重试（PlannerV3.plan() 已经有重试机制）
+        if step.step_type == "sub_planner":
+            result = await self.execute(step)
+            return result
+
         last_error = None
         for attempt in range(step.max_retries):
             if attempt > 0:
@@ -923,7 +949,7 @@ class ExecutionEngineV3:
                 input_data = dict(step.input_data)  # 复制一份
                 for dep_id in step.depends_on:
                     artifact = self.state.artifacts.get(dep_id)
-                    if artifact:
+                    if artifact is not None:
                         input_data[f"_dep_{dep_id}"] = artifact
                 evt = Event(
                     event_type=EventType.STEP_READY,
@@ -1004,7 +1030,7 @@ class PlannerV3:
     def __init__(self, llm: AsyncOpenAI):
         self.llm = llm
 
-    async def plan(self, task: str, tools: List[Dict]) -> PlanV3:
+    async def plan(self, task: str, tools: List[Dict], max_retries: int = 5) -> PlanV3:
         logger.info(f"[PlannerV3] Generating DAG for task: {task[:50]}...")
         tools_desc = "\n".join([f"- {t.get('name')}: {t.get('description')}" for t in tools])
         prompt = f"""任务：{task}
@@ -1032,68 +1058,88 @@ class PlannerV3:
 }}"""
         # response_format={"type": "json_object"} 是 OpenAI 的参数
         # 使用时需要确保模型支持，否则会忽略
-        try:
-            response = await self.llm.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "system", "content": "你是一个任务规划器。请将任务分解为可执行的步骤序列（DAG）。"}, {"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=6000
-            )
-        except Exception as e:
-            logger.error(f"[PlannerV3] LLM call failed: {e}")
-            response = None
+        last_error = None
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.info(f"[PlannerV3] Retry attempt {attempt + 1}/{max_retries} for plan generation")
+                await asyncio.sleep(0.5 * (attempt + 1))  # 指数退避
+            try:
+                response = await self.llm.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "system", "content": "你是一个任务规划器。请将任务分解为可执行的步骤序列（DAG）。"}, {"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=6000
+                )
 
-        if not response or not response.choices:
-            logger.error("[PlannerV3] No response from LLM")
-            return PlanV3(plan_id=f"plan-{uuid.uuid4().hex[:8]}", task=task)
+                if not response or not response.choices:
+                    last_error = "No response from LLM"
+                    logger.warning(f"[PlannerV3] No response from LLM (attempt {attempt + 1})")
+                    continue
 
-        plan_json = self._parse_response(response.choices[0].message.content)
-        plan_id = f"plan-{uuid.uuid4().hex[:8]}"
-        plan = PlanV3(plan_id=plan_id, task=task)
+                raw_response = response.choices[0].message.content
+                plan_json = self._parse_response(raw_response)
+                steps_data = plan_json.get("steps", [])
 
-        # JSON schema 校验
-        steps_data = plan_json.get("steps", [])
-        for step_data in steps_data:
-            # 校验必需字段
-            step_id = step_data.get("id")
-            step_type = step_data.get("type")
+                # 检查是否生成了有效步骤
+                if not steps_data:
+                    last_error = "Empty steps from LLM"
+                    logger.warning(f"[PlannerV3] Empty steps from LLM (attempt {attempt + 1})")
+                    continue
 
-            if not step_id:
-                logger.warning(f"[PlannerV3] Skipping step without id: {step_data}")
+                # 成功生成了步骤，跳出重试循环
+                plan_id = f"plan-{uuid.uuid4().hex[:8]}"
+                plan = PlanV3(plan_id=plan_id, task=task)
+
+                # JSON schema 校验
+                for step_data in steps_data:
+                    # 校验必需字段
+                    step_id = step_data.get("id")
+                    step_type = step_data.get("type")
+
+                    if not step_id:
+                        logger.warning(f"[PlannerV3] Skipping step without id: {step_data}")
+                        continue
+                    if step_type not in ["tool", "llm", "search", "analyze", "answer"]:
+                        logger.warning(f"[PlannerV3] Invalid step type '{step_type}' for step {step_id}, using 'llm'")
+                        step_type = "llm"
+
+                    step = StepV3(
+                        step_id=step_id,
+                        step_type=step_type,
+                        depends_on=step_data.get("depends_on", []),
+                        input_data=step_data.get("input_data", {}),
+                        tool_name=step_data.get("tool_name"),
+                        tool_args=step_data.get("tool_args", {}),
+                        max_retries=step_data.get("max_retries", 3)
+                    )
+                    if not plan.add_step(step):
+                        logger.warning(f"[PlannerV3] Failed to add step {step_id}")
+
+                # 循环依赖检测
+                cycle = self._detect_cycle(plan)
+                if cycle:
+                    logger.error(f"[PlannerV3] Cycle detected in plan: {' -> '.join(cycle)}")
+                    # 移除循环依赖：找到循环中的最后一个步骤，移除其依赖
+                    cycle_step_id = cycle[-1]
+                    cycle_step = plan.steps.get(cycle_step_id)
+                    if cycle_step:
+                        # 找到循环中的前一个步骤，断开依赖
+                        cycle_prev = cycle[-2] if len(cycle) > 1 else None
+                        if cycle_prev and cycle_prev in cycle_step.depends_on:
+                            cycle_step.depends_on.remove(cycle_prev)
+
+                plan.status = "planned"
+                logger.info(f"[PlannerV3] Generated plan with {len(plan.steps)} steps")
+                return plan
+
+            except Exception as e:
+                last_error = f"LLM call failed: {e}"
+                logger.error(f"[PlannerV3] LLM call failed (attempt {attempt + 1}): {e}")
                 continue
-            if step_type not in ["tool", "llm", "search", "analyze", "answer"]:
-                logger.warning(f"[PlannerV3] Invalid step type '{step_type}' for step {step_id}, using 'llm'")
-                step_type = "llm"
 
-            step = StepV3(
-                step_id=step_id,
-                step_type=step_type,
-                depends_on=step_data.get("depends_on", []),
-                input_data=step_data.get("input_data", {}),
-                tool_name=step_data.get("tool_name"),
-                tool_args=step_data.get("tool_args", {}),
-                max_retries=step_data.get("max_retries", 3)
-            )
-            if not plan.add_step(step):
-                logger.warning(f"[PlannerV3] Failed to add step {step_id}")
-
-        # 循环依赖检测
-        cycle = self._detect_cycle(plan)
-        if cycle:
-            logger.error(f"[PlannerV3] Cycle detected in plan: {' -> '.join(cycle)}")
-            # 移除循环依赖：找到循环中的最后一个步骤，移除其依赖
-            cycle_step_id = cycle[-1]
-            cycle_step = plan.steps.get(cycle_step_id)
-            if cycle_step:
-                # 找到循环中的前一个步骤，断开依赖
-                cycle_prev = cycle[-2] if len(cycle) > 1 else None
-                if cycle_prev and cycle_prev in cycle_step.depends_on:
-                    cycle_step.depends_on.remove(cycle_prev)
-                    logger.info(f"[PlannerV3] Removed cycle dependency: {cycle_step_id} -> {cycle_prev}")
-
-        plan.status = "planned"
-        logger.info(f"[PlannerV3] Generated plan with {len(plan.steps)} steps")
-        return plan
+        # 所有重试都失败了
+        logger.error(f"[PlannerV3] Plan generation failed after {max_retries} attempts: {last_error}")
+        return PlanV3(plan_id=f"plan-{uuid.uuid4().hex[:8]}", task=task)
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """解析 LLM 响应为 JSON"""
@@ -1271,6 +1317,11 @@ async def main():
     agent = ProductionAgentOS_v3(worker_count=2, skills_dir="skills")
     task = "hello"
     agent.register_tool(name="tavily_search", func=lambda q: None, description="使用 Tavily 进行网络搜索")
+    agent.register_tool(
+        name="sub_planner",
+        func=lambda task, llm, tools: None,  # 占位符，实际由 execute_sub_planner 实现
+        description="根据任务生成子执行计划（DAG），返回计划元数据"
+    )
     try:
         result = await agent.run(task, timeout=300)
         logger.info("=" * 70)
