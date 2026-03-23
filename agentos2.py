@@ -664,6 +664,9 @@ class WorkerV3:
             # 修复：只发布事件，不修改step.status
             # 状态更新完全由 Engine 在 process_completed 中完成
             if success:
+                # 打印步骤执行结果
+                logger.info(f"[{self.worker_id}] Step {step.step_id[:8]} ({step.step_type}) completed successfully")
+                logger.info(f"[{self.worker_id}] Result: {str(result)[:500]}...")
                 # 存储到 state.artifacts（Engine 会同步这个状态）
                 if self.engine.state:
                     self.engine.state.artifacts[step_id] = result
@@ -674,6 +677,8 @@ class WorkerV3:
                 )
                 await self.bus.publish(evt)
             else:
+                # 打印步骤失败结果
+                logger.error(f"[{self.worker_id}] Step {step.step_id[:8]} ({step.step_type}) failed: {str(result)[:200]}")
                 evt = Event(
                     event_type=EventType.STEP_FAILED,
                     step_id=step_id,
@@ -847,9 +852,9 @@ class ExecutionEngineV3:
         """启动调度循环 - 唯一调度器"""
         if not self.bus:
             raise RuntimeError("Event bus not set")
-        # Engine 订阅 STEP_COMPLETED 和 STEP_FAILED 事件
-        self.bus.subscribe(self.process_completed)
-        self.bus.subscribe(self.process_failed)
+        # 注意：事件订阅在 run() 中统一管理，避免重复订阅
+        # self.bus.subscribe(self.process_completed)  # 已在 run() 中订阅
+        # self.bus.subscribe(self.process_failed)     # 已在 run() 中订阅
         self._running = True
         logger.info("[Engine] Started, publishing initial READY steps...")
         # 发布初始 READY 步骤（设置状态为READY并发布）
@@ -932,6 +937,10 @@ class ExecutionEngineV3:
             self.state.update_step(event.step_id, status="completed", output=event.payload.get("output"))
         # 修复：发布 READY 步骤
         await self._publish_ready_steps()
+        # 修复：如果所有步骤都已完成，发布 TASK_COMPLETED 事件
+        if self.plan and self.plan.is_complete():
+            logger.info("[Engine] All steps completed!")
+            await self.bus.publish(Event(event_type=EventType.TASK_COMPLETED, task_id=self.plan.plan_id, payload={"plan_id": self.plan.plan_id}))
 
     async def process_failed(self, event: Event):
         """
@@ -1175,10 +1184,14 @@ class ProductionAgentOS_v3:
         self._completion_event = asyncio.Event()
         # 订阅 TASK_COMPLETED 和 TASK_FAILED 事件来触发 completion event
         async def on_task_completed(event: Event):
+            if event.event_type != EventType.TASK_COMPLETED:
+                return
             logger.info("[AgentOS] TASK_COMPLETED event received")
             if self._completion_event and not self._completion_event.is_set():
                 self._completion_event.set()
         async def on_task_failed(event: Event):
+            if event.event_type != EventType.TASK_FAILED:
+                return
             logger.info("[AgentOS] TASK_FAILED event received")
             if self._completion_event and not self._completion_event.is_set():
                 self._completion_event.set()
