@@ -248,20 +248,28 @@ class EventSubscriptionManager:
             return sid
 
     async def unsubscribe_component(self, component: str):
-        if component not in self._subscriptions:
-            return
-        handlers = list(self._subscriptions[component].items())
-        for name, sid in handlers:
-            self._bus.unsubscribe(sid)
-            if sid in self._id_to_handler:
-                del self._id_to_handler[sid]
-            logger.debug(f"[EventSubscriptionManager] {component}.{name} unsubscribed")
-        del self._subscriptions[component]
+        async with self._lock:
+            if component not in self._subscriptions:
+                return
+            handlers = list(self._subscriptions[component].items())
+            for name, sid in handlers:
+                self._bus.unsubscribe(sid)
+                if sid in self._id_to_handler:
+                    del self._id_to_handler[sid]
+                logger.debug(f"[EventSubscriptionManager] {component}.{name} unsubscribed")
+            del self._subscriptions[component]
 
     async def unsubscribe_all(self):
-        components = list(self._subscriptions.keys())
-        for component in components:
-            await self.unsubscribe_component(component)
+        async with self._lock:
+            components = list(self._subscriptions.keys())
+            for component in components:
+                handlers = list(self._subscriptions[component].items())
+                for name, sid in handlers:
+                    self._bus.unsubscribe(sid)
+                    if sid in self._id_to_handler:
+                        del self._id_to_handler[sid]
+                    logger.debug(f"[EventSubscriptionManager] {component}.{name} unsubscribed")
+            self._subscriptions.clear()
 
     def get_subscription_info(self) -> Dict[str, List[str]]:
         return {
@@ -1960,6 +1968,9 @@ class ExecutionEngine:
 
     async def claim_step(self, step_id: str) -> bool:
         async with self._claim_lock:
+            # 【关键修复】检查是否已完成，防止已完成的任务被重新声明
+            if step_id in self._completed_steps:
+                return False
             if step_id in self._claiming_steps:
                 return False
             self._claiming_steps.add(step_id)
@@ -2072,6 +2083,7 @@ class ExecutionEngine:
         ) if steps else False
 
         if all_done and total > 0:
+            # 【修复】直接 await 发布完成事件
             if failed_count == 0:
                 logger.info(f"[Engine] All steps completed ({completed_count}/{total}), publishing TASK_COMPLETED")
                 if self.bus:
@@ -2365,23 +2377,27 @@ class Worker:
         if not step_id or not self.engine:
             return
 
-        # 快速检查和标记（短临界区）
+        # 【关键修复】在获取锁之前先快速检查多个状态
+        if step_id in self.engine._completed_steps:
+            logger.debug(f"[Worker {self.worker_id}] Step {step_id} already completed, skipping")
+            return
+
+        # 【关键修复】在锁内同时完成所有检查和 claim，避免竞态
         async with self.engine._step_execution_lock:
-            # 检查是否已经完成
+            # 检查所有状态
             if step_id in self.engine._completed_steps:
+                logger.debug(f"[Worker {self.worker_id}] Step {step_id} already completed (in lock), skipping")
                 return
-            # 检查是否正在执行
+            if step_id in self.engine._claiming_steps:
+                logger.debug(f"[Worker {self.worker_id}] Step {step_id} already claimed (in lock), skipping")
+                return
             if step_id in self.engine._executing_steps:
+                logger.debug(f"[Worker {self.worker_id}] Step {step_id} already executing, skipping")
                 return
             # 标记为正在执行
             self.engine._executing_steps.add(step_id)
-
-        # 【修复】尝试声明步骤执行权（不在锁内）
-        claimed = await self.engine.claim_step(step_id)
-        if not claimed:
-            async with self.engine._step_execution_lock:
-                self.engine._executing_steps.discard(step_id)
-            return
+            # 同时 claim（在锁内，防止竞态）
+            self.engine._claiming_steps.add(step_id)
 
         # 从 DynamicPlan 获取 step
         dynamic_plan = getattr(self.engine, 'dynamic_plan', None)
@@ -2449,10 +2465,13 @@ class Worker:
                 await self._handle_exception(step_id, step, e, duration_ms)
 
         finally:
-            # 释放步骤声明
-            await self.engine.release_claim(step_id)
+            # 【关键修复】先标记已完成，再释放 claim，防止其他 Worker 抢走
             async with self.engine._step_execution_lock:
+                # 标记为已完成（在释放 claim 之前！）
+                self.engine._completed_steps.add(step_id)
                 self.engine._executing_steps.discard(step_id)
+            # 释放步骤声明（在标记完成后）
+            await self.engine.release_claim(step_id)
 
     async def _handle_execution_result(self, step_id: str, step: Step, success: bool, result: Any, duration_ms: int):
         """【新增】统一处理执行结果"""
