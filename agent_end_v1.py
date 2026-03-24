@@ -3191,7 +3191,7 @@ class ProductionAgentOS:
 # =========================
 async def main():
     agent = ProductionAgentOS(worker_count=2, skills_dir="skills", tools_dir="tools")
-    task = "code帮我写一个python代码，1+2+……+100=，然后写成文件到/home/aixz/data/hxf/bigmodel/ai_code/testp/agentv7/add.py"
+    task = "/home/aixz/data/hxf/bigmodel/ai_code/testp/agentv7/sum_calculator.py读取这个文件，然后总结其中函数的功能"
     try:
         result = await agent.run(task, timeout=300)
         logger.info("=" * 70)
