@@ -2076,39 +2076,52 @@ class ExecutionEngine:
         failed_count = sum(1 for s in steps.values() if s.status == StepState.FAILED)
         total = len(steps)
 
+        logger.info(f"[Engine] _check_and_publish_completion: completed={completed_count}, failed={failed_count}, total={total}")
+        for step_id, step in steps.items():
+            logger.info(f"[Engine] Step {step_id[:8]} status: {step.status}")
+
         # 检查是否所有步骤都处于终态
         all_done = all(
             s.status in [StepState.COMPLETED, StepState.FAILED, StepState.BLOCKED]
             for s in steps.values()
         ) if steps else False
 
+        logger.info(f"[Engine] all_done={all_done}")
+
         if all_done and total > 0:
-            # 【修复】直接 await 发布完成事件
+            # 【修复】使用非阻塞方式发布完成事件，避免死锁
             if failed_count == 0:
                 logger.info(f"[Engine] All steps completed ({completed_count}/{total}), publishing TASK_COMPLETED")
                 if self.bus:
-                    await self.bus.publish(Event(
+                    asyncio.create_task(self.bus.publish(Event(
                         event_type=EventType.TASK_COMPLETED,
                         payload={"total_steps": total, "completed_steps": completed_count}
-                    ))
+                    ), block=False))
             else:
                 logger.info(f"[Engine] Task failed ({failed_count}/{total} steps failed), publishing TASK_FAILED")
                 if self.bus:
-                    await self.bus.publish(Event(
+                    asyncio.create_task(self.bus.publish(Event(
                         event_type=EventType.TASK_FAILED,
                         payload={"total_steps": total, "failed_steps": failed_count}
-                    ))
+                    ), block=False))
 
     async def process_completed(self, event: Event):
         """处理 STEP_COMPLETED 事件"""
         if event.event_type != EventType.STEP_COMPLETED or not event.step_id:
             return
         # 使用锁防止重复处理
+        is_duplicate = False
         async with self._step_execution_lock:
             if event.step_id in self._completed_steps:
-                logger.info(f"[Engine] STEP_COMPLETED for {event.step_id[:8]} (duplicate, skipped)")
-                return
-            self._completed_steps.add(event.step_id)
+                logger.info(f"[Engine] STEP_COMPLETED for {event.step_id[:8]} (duplicate, skipping artifact update)")
+                is_duplicate = True
+            else:
+                self._completed_steps.add(event.step_id)
+
+        # 【修复】即使重复，也要检查任务是否完成（在锁外调用）
+        if is_duplicate:
+            await self._check_and_publish_completion()
+            return
 
         logger.info(f"[Engine] STEP_COMPLETED for {event.step_id[:8]}")
 
@@ -2432,6 +2445,8 @@ class Worker:
 
         # 【修复】执行在锁外进行
         start_time = time.time()
+        event_type = None
+        payload = {}
         try:
             logger.info(f"[Worker {self.worker_id}] Executing step {step_id}...")
 
@@ -2445,38 +2460,49 @@ class Worker:
             duration_ms = int((time.time() - start_time) * 1000)
             logger.info(f"[Worker {self.worker_id}] Step {step_id} executed, success={success}, duration={duration_ms}ms")
 
-            # 【修复】处理结果在锁内进行（快速操作）
-            async with self.engine._step_execution_lock:
-                await self._handle_execution_result(step_id, step, success, result, duration_ms)
+            # 【修复】处理结果不在锁内进行，避免死锁
+            event_type, payload = await self._handle_execution_result(step_id, step, success, result, duration_ms)
 
         except asyncio.TimeoutError:
             duration_ms = int((time.time() - start_time) * 1000)
             error_result = f"Error: Step execution timeout (>{timeout}s)"
             logger.warning(f"[Worker {self.worker_id}] Step {step_id} timeout after {timeout}s")
 
-            async with self.engine._step_execution_lock:
-                await self._handle_timeout(step_id, step, error_result, duration_ms)
+            event_type, payload = await self._handle_timeout(step_id, step, error_result, duration_ms)
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             logger.exception(f"[Worker {self.worker_id}] Execution failed: {e}")
 
-            async with self.engine._step_execution_lock:
-                await self._handle_exception(step_id, step, e, duration_ms)
+            event_type, payload = await self._handle_exception(step_id, step, e, duration_ms)
 
         finally:
             # 【关键修复】先标记已完成，再释放 claim，防止其他 Worker 抢走
+            # 在这里直接添加到 _completed_steps，避免竞态条件
+            # 同时更新 StepPlan 状态，确保 _check_and_publish_completion 能正确检测
             async with self.engine._step_execution_lock:
-                # 标记为已完成（在释放 claim 之前！）
                 self.engine._completed_steps.add(step_id)
                 self.engine._executing_steps.discard(step_id)
+                # 更新 StepPlan 状态
+                if self.engine.plan and step_id in self.engine.plan.steps:
+                    self.engine.plan.steps[step_id].status = StepState.COMPLETED
+                # 更新 dynamic_plan 状态（如果存在）
+                dynamic_plan = getattr(self.engine, 'dynamic_plan', None)
+                if dynamic_plan and step_id in dynamic_plan.steps:
+                    dynamic_plan.steps[step_id].status = StepState.COMPLETED
             # 释放步骤声明（在标记完成后）
             await self.engine.release_claim(step_id)
+            
+            # 【修复】在释放锁之后发布事件，避免死锁
+            if event_type:
+                await self._publish_event(event_type, step_id, payload)
 
     async def _handle_execution_result(self, step_id: str, step: Step, success: bool, result: Any, duration_ms: int):
-        """【新增】统一处理执行结果"""
+        """【新增】统一处理执行结果，返回要发布的事件类型和 payload"""
         # 【修复】正确提取实际输出
         output_str = extract_output(result)
+        event_type = None
+        payload = {}
 
         if success:
             # 检查是否是早停（保护机制触发）
@@ -2495,7 +2521,8 @@ class Worker:
                     success=True
                 )
                 self.engine.state.add_trace(trace)
-                await self._publish_event(EventType.STEP_COMPLETED, step_id, {"output": output_str})
+                event_type = EventType.STEP_COMPLETED
+                payload = {"output": output_str}
             elif self.critic:
                 # 进行质量检查
                 artifact = Artifact.create_success(output_str, step_id=step_id)
@@ -2518,7 +2545,8 @@ class Worker:
                         error=result_str
                     )
                     self.engine.state.add_trace(trace)
-                    await self._publish_event(EventType.STEP_FAILED, step_id, {"error": result_str})
+                    event_type = EventType.STEP_FAILED
+                    payload = {"error": result_str}
                 else:
                     trace = StepTrace(
                         step_id=step_id,
@@ -2528,7 +2556,8 @@ class Worker:
                         success=True
                     )
                     self.engine.state.add_trace(trace)
-                    await self._publish_event(EventType.STEP_COMPLETED, step_id, {"output": output_str})
+                    event_type = EventType.STEP_COMPLETED
+                    payload = {"output": output_str}
             else:
                 artifact = Artifact.create_success(output_str, step_id=step_id)
                 self.engine.state.update_artifact(step_id, artifact)
@@ -2541,7 +2570,8 @@ class Worker:
                     success=True
                 )
                 self.engine.state.add_trace(trace)
-                await self._publish_event(EventType.STEP_COMPLETED, step_id, {"output": output_str})
+                event_type = EventType.STEP_COMPLETED
+                payload = {"output": output_str}
         else:
             # 【修复】正确处理失败情况
             error_str = str(result) if not isinstance(result, dict) else json.dumps(result, ensure_ascii=False)
@@ -2557,10 +2587,13 @@ class Worker:
                 error=error_str
             )
             self.engine.state.add_trace(trace)
-            await self._publish_event(EventType.STEP_FAILED, step_id, {"error": error_str})
+            event_type = EventType.STEP_FAILED
+            payload = {"error": error_str}
+        
+        return event_type, payload
 
     async def _handle_timeout(self, step_id: str, step: Step, error_result: str, duration_ms: int):
-        """【新增】处理超时"""
+        """【新增】处理超时，返回要发布的事件类型和 payload"""
         artifact = Artifact.create_error(error_result, step_id=step_id)
         self.engine.state.update_artifact(step_id, artifact)
 
@@ -2573,10 +2606,10 @@ class Worker:
             error=error_result
         )
         self.engine.state.add_trace(trace)
-        await self._publish_event(EventType.STEP_FAILED, step_id, {"error": error_result})
+        return EventType.STEP_FAILED, {"error": error_result}
 
     async def _handle_exception(self, step_id: str, step: Step, exception: Exception, duration_ms: int):
-        """【新增】处理异常"""
+        """【新增】处理异常，返回要发布的事件类型和 payload"""
         error_str = str(exception)
         artifact = Artifact.create_error(error_str, step_id=step_id)
         self.engine.state.update_artifact(step_id, artifact)
@@ -2590,7 +2623,7 @@ class Worker:
             error=error_str
         )
         self.engine.state.add_trace(trace)
-        await self._publish_event(EventType.STEP_FAILED, step_id, {"error": error_str})
+        return EventType.STEP_FAILED, {"error": error_str}
 
     def _build_step_context(self, step: Step, input_data: Dict) -> Dict:
         """构建 StepContext（简化版本）"""
