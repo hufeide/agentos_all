@@ -3126,6 +3126,50 @@ class ProductionAgentOS:
         completed_from_artifacts = len(self.engine.state.artifacts)
         completed_count = max(completed_count, completed_from_artifacts)
 
+        # 收集所有步骤的实际输出结果
+        step_results = {}
+        for step_id, step in self.engine.plan.steps.items():
+            # 检查步骤是否有输出（通过 artifacts 获取）
+            step_output = None
+            if self.engine.state and self.engine.state.artifacts:
+                # 查找与步骤相关的 artifact
+                for artifact_id, artifact in self.engine.state.artifacts.items():
+                    if artifact_id == step_id or artifact_id.startswith(step_id):
+                        step_output = extract_output(artifact)
+                        break
+            
+            if step.status == StepState.COMPLETED and step_output:
+                # 清理输出格式，提取实际内容
+                cleaned_output = self._clean_output(step_output)
+                step_results[step_id] = {
+                    "step_id": step_id,
+                    "status": "completed",
+                    "output": cleaned_output,
+                    "skill_name": step.target_agent if hasattr(step, 'target_agent') else "unknown"
+                }
+            elif step.status == StepState.FAILED:
+                step_results[step_id] = {
+                    "step_id": step_id,
+                    "status": "failed",
+                    "error": step_output if step_output else "Unknown error",
+                    "skill_name": step.target_agent if hasattr(step, 'target_agent') else "unknown"
+                }
+
+        # 收集最终结果（最后一个完成的步骤的输出）
+        final_result = None
+        if self.engine.state.artifacts:
+            # 使用最后一个artifact作为最终结果
+            final_artifact = list(self.engine.state.artifacts.values())[-1]
+            final_result = self._clean_output(extract_output(final_artifact))
+        elif step_results:
+            # 使用最后一个完成的步骤的输出作为最终结果
+            last_completed_step = None
+            for step_id, result in step_results.items():
+                if result["status"] == "completed":
+                    last_completed_step = result
+            if last_completed_step:
+                final_result = last_completed_step["output"]
+
         await self._cleanup()
 
         return {
@@ -3133,8 +3177,42 @@ class ProductionAgentOS:
             "total_steps": total,
             "completed_steps": completed_count,
             "failed_steps": failed_count,
-            "plan_id": plan.plan_id if plan else "unknown"
+            "plan_id": plan.plan_id if plan else "unknown",
+            "final_result": final_result,
+            "step_results": step_results,
+            "artifacts_count": len(self.engine.state.artifacts) if self.engine.state else 0
         }
+
+    def _clean_output(self, output: str) -> str:
+        """清理输出格式，提取实际内容"""
+        if not output:
+            return ""
+        
+        # 如果是 Artifact 对象，提取 value 字段
+        if "Artifact(value=" in output:
+            # 提取 Artifact 的 value 内容
+            import re
+            match = re.search(r"Artifact\(value='([^']*)'", output)
+            if match:
+                return match.group(1)
+        
+        # 如果是 JSON 字符串，尝试解析
+        try:
+            import json
+            data = json.loads(output)
+            if isinstance(data, dict):
+                if "output" in data:
+                    return str(data["output"])
+                elif "result" in data:
+                    return str(data["result"])
+                elif "content" in data:
+                    return str(data["content"])
+            return str(data)
+        except:
+            pass
+        
+        # 返回原始输出
+        return output
 
     async def _wait_for_completion(self, timeout: float):
         """等待完成（备用方案）"""
@@ -3190,22 +3268,22 @@ class ProductionAgentOS:
 # 运行入口
 # =========================
 async def main():
+    import traceback
     agent = ProductionAgentOS(worker_count=2, skills_dir="skills", tools_dir="tools")
     task = "/home/aixz/data/hxf/bigmodel/ai_code/testp/agentv7/sum_calculator.py读取这个文件，然后总结其中函数的功能"
     try:
         result = await agent.run(task, timeout=300)
-        logger.info("=" * 70)
-        logger.info("最终结果")
-        logger.info("=" * 70)
-        logger.info(f"Status: {result.get('status')}")
-        logger.info(f"Plan ID: {result.get('plan_id')}")
-        logger.info(f"Total Steps: {result.get('total_steps')}")
-        logger.info(f"Completed: {result.get('completed_steps')}")
-        logger.info("=" * 70)
+        
+        # 返回完整的 JSON 结果
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        
     except Exception as e:
-        logger.error(f"错误：{e}")
-        import traceback
-        traceback.print_exc()
+        error_result = {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+        print(json.dumps(error_result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
